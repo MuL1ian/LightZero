@@ -26,7 +26,6 @@ from datasets import load_dataset
 import numpy as np
 import warnings
 
-# from .simulation_model import predict_spectrum
 
 
 
@@ -138,8 +137,9 @@ valid_atoms = filter_valid_atoms(atom_tokens)
 bond_constraints = get_bond_constraints()
 # Example of bond constraints: {'N': 3, 'O': 2, 'P': 3, 'H': 1, 'B': 3, 'Br': 1, 'S': 2, 'C': 4, 'Cl': 1, 'F': 1, 'I': 1}
 
-def load_massspecgym_data():
+#TODO: 使用encoder_dataset
 
+def load_massspecgym_data():
     ds = load_dataset("roman-bushuiev/MassSpecGym")
     train_data = pd.DataFrame(ds['val'])
     train_only = train_data[train_data['fold'] == 'train']
@@ -226,7 +226,7 @@ class MassGymEnv(gym.Env):
 
 
         self.use_massspecgym_data = cfg.get('use_massspecgym_data', True)
-        self.formula_masking = cfg.get('formula_masking', False)
+        self.formula_masking = cfg.get('formula_masking', True)
         
         self.chance = 0.0
         
@@ -347,7 +347,6 @@ class MassGymEnv(gym.Env):
         if self.use_massspecgym_data:
             self.random_massspecgym_data()
         else:
-            # 设置一些常见的质谱峰
             self.target_mzs = np.array([
                 15.0,   # CH3+ 甲基碎片
                 29.0,   # C2H5+ 乙基碎片
@@ -358,7 +357,6 @@ class MassGymEnv(gym.Env):
                 105.0,  # C8H9+ 甲基苯基碎片
             ])
             
-            # 设置对应的相对强度
             self.target_ints = np.array([
                 0.3,    # CH3+ 中等强度
                 0.5,    # C2H5+ 较强
@@ -372,7 +370,6 @@ class MassGymEnv(gym.Env):
             # 归一化强度
             self.target_ints = self.target_ints / np.max(self.target_ints)
             
-            # 设置目标分子信息
             self.target_molecule = {
                 'smiles': "CC1=CC=CC=C1C",  # 邻二甲苯
                 'formula': "C8H10"           # 分子式
@@ -465,6 +462,7 @@ class MassGymEnv(gym.Env):
         for variants in branch_variants.values():
             allowed_tokens.update(variants)
         
+
         return allowed_tokens
 
     def get_valid_actions(self): 
@@ -479,11 +477,9 @@ class MassGymEnv(gym.Env):
             if self.formula_masking and hasattr(self, 'target_molecule') and self.target_molecule.get('formula'):
                 formula = self.target_molecule.get('formula')
                 allowed_elements = self._get_allowed_elements_from_formula(formula)
-
                 for i, action in enumerate(self.actions_list):
                     if action in self.atom_tokens or action in self.bonded_atom_tokens:
-                        element = extract_element(action)
-                        if element and f"[{element}]" not in allowed_elements and element != 'H':
+                        if action not in allowed_elements:
                             mask[i] = False
 
         except Exception as e:
@@ -501,6 +497,8 @@ class MassGymEnv(gym.Env):
             idx = self.actions_list.index(self.remove_token)
             mask[idx] = False
 
+        print(mask)
+        print(">" *24)
         return mask
 
 
@@ -680,8 +678,7 @@ class MassGymEnv(gym.Env):
         if self.need_flatten:
             encoded_obs = encoded_obs.reshape(-1)
 
-        print(encoded_obs)
-        print(">" *24)
+
         return encoded_obs.astype(np.float32)
 
     

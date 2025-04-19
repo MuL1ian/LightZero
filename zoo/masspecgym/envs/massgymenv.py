@@ -32,7 +32,7 @@ from torch.utils.data import Dataset
 
 
 class DebugSpectrumDataset(Dataset):
-    def __init__(self, file_path="/MassEnv/main/LightZero/zoo/masspecgym/envs/debug_spectrum_embeds.pt"):
+    def __init__(self, file_path="/Users/boyeniu/Desktop/nus_course/NUS_JAX/MassEnv/policy_model/debug_spectrum_embeds.pt"):
         self.data = torch.load(file_path)
 
         list_lengths = []
@@ -459,7 +459,7 @@ class MassGymEnv(gym.Env):
             # Only filter if formula_masking is enabled and formula exists
             if self.formula_masking and hasattr(self, 'target_spectrum') and self.target_spectrum.get('formulas'):
                 formula = self.target_spectrum.get('formulas')
-                allowed_elements = self._get_allowed_elements_from_formula(formula)
+                allowed_elements = self._get_allowed_elements_from_formula()
                 for i, action in enumerate(self.actions_list):
                     if action in self.atom_tokens or action in self.bonded_atom_tokens:
                         if action not in allowed_elements:
@@ -475,13 +475,10 @@ class MassGymEnv(gym.Env):
             idx = self.actions_list.index(self.end_token)
             mask[idx] = True
 
-        # Disallow remove_token if current_selfies is empty
         if not self.current_selfies and self.remove_token in self.actions_list:
             idx = self.actions_list.index(self.remove_token)
             mask[idx] = False
 
-        print(mask)
-        print(">" *24)
         return mask
 
 

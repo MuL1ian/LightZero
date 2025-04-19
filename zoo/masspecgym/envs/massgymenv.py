@@ -25,7 +25,45 @@ import torch as th
 from datasets import load_dataset
 import numpy as np
 import warnings
+import torch
+import random
+from torch.utils.data import Dataset
 
+
+
+class DebugSpectrumDataset(Dataset):
+    def __init__(self, file_path="/MassEnv/main/LightZero/zoo/masspecgym/envs/debug_spectrum_embeds.pt"):
+        self.data = torch.load(file_path)
+
+        list_lengths = []
+        for key, value in self.data.items():
+            if isinstance(value, list):
+                list_lengths.append(len(value))
+            elif isinstance(value, torch.Tensor) and len(value.shape) > 0:
+                list_lengths.append(value.shape[0])
+        if len(set(list_lengths)) > 1:
+            print(f"Error: data fields have different lengths: {list_lengths}")
+
+        self.size = list_lengths[0] if list_lengths else 0
+        print(f"Loaded {self.size} samples")
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        result = {}
+        for key, value in self.data.items():
+            if isinstance(value, list):
+                if idx < len(value):
+                    result[key] = value[idx]
+            elif isinstance(value, torch.Tensor) and len(value.shape) > 0:
+                if idx < value.shape[0]:
+                    result[key] = value[idx]
+        return result
+
+    def random_sample(self):
+        idx = random.randint(0, self.size - 1)
+        return self.__getitem__(idx)
 
 
 
@@ -137,17 +175,9 @@ valid_atoms = filter_valid_atoms(atom_tokens)
 bond_constraints = get_bond_constraints()
 # Example of bond constraints: {'N': 3, 'O': 2, 'P': 3, 'H': 1, 'B': 3, 'Br': 1, 'S': 2, 'C': 4, 'Cl': 1, 'F': 1, 'I': 1}
 
-#TODO: 使用encoder_dataset
 
-def load_massspecgym_data():
-    ds = load_dataset("roman-bushuiev/MassSpecGym")
-    train_data = pd.DataFrame(ds['val'])
-    train_only = train_data[train_data['fold'] == 'train']
-    train_info = train_only[['identifier','mzs','intensities','smiles', 'formula', 'adduct', 'instrument_type','collision_energy']].copy()
-    train_info['mzs'] = train_info['mzs'].apply(lambda x: np.array(x.split(','), dtype=float))
-    train_info['intensities'] = train_info['intensities'].apply(lambda x: np.array(x.split(','), dtype=float))
 
-    return train_info
+
 
 
 @ENV_REGISTRY.register('massgym')
@@ -167,8 +197,8 @@ class MassGymEnv(gym.Env):
         reward_type='cosine_similarity',
         
         target_spectrum={
-            'mz_values': np.array([]),
-            'intensities': np.array([])
+            'embeds': torch.tensor([]),
+            'formulas': ''
         },
         
         delay_reward_step=0,
@@ -190,9 +220,7 @@ class MassGymEnv(gym.Env):
         ring_tokens=[],
         
         max_len=10,
-        
-        use_massspecgym_data=True,
-        formula_masking=False,
+        formula_masking=True,
     )
 
     @classmethod
@@ -224,16 +252,14 @@ class MassGymEnv(gym.Env):
         self.ignore_legal_actions = cfg.get('ignore_legal_actions', False)
         self.need_flatten = cfg.get('need_flatten', False)
 
-
-        self.use_massspecgym_data = cfg.get('use_massspecgym_data', True)
         self.formula_masking = cfg.get('formula_masking', True)
         
         self.chance = 0.0
         
         self.frames = []
 
-        self.target_mzs = np.array(cfg.get('target_spectrum', {}).get('mz_values', []))
-        self.target_ints = np.array(cfg.get('target_spectrum', {}).get('intensities', []))
+        self.target_embeds = cfg.get('target_spectrum', {}).get('embeds', [])
+        self.target_formula = cfg.get('target_spectrum', {}).get('formulas', '')
         
         use_all_tokens = cfg.get('use_all_atom_tokens', False)
          
@@ -272,12 +298,7 @@ class MassGymEnv(gym.Env):
                              [self.remove_token, self.end_token])
         
 
-        
-        self.vocab = self.atom_tokens + self.bonded_atom_tokens + ["[nop]"]
-
-
-        self.vocab_size = len(self.vocab)
-        self.max_len = cfg.get('max_len', 10)
+        self.max_len = cfg.get('max_len', 100)
         
         
         self.episode_return = 0
@@ -286,49 +307,36 @@ class MassGymEnv(gym.Env):
 
         # set the action space and observation space for the gym interface
         self._action_space = spaces.Discrete(len(self.actions_list))
-        # the observation space is a one-hot encoded molecular state
-
-        self._observation_space = spaces.Box(0, 1, (self.max_len, self.vocab_size), dtype=int)
-        self._reward_range = (0., 1.)
         
+        self._reward_range = (0., 1.)
         
         # initialize the state
         self.current_selfies = ""
         self.bond_counts = []
-        self.current_mol = None
+        self.smiles = ""
         
 
         self.bond_constraints = cfg.get('bond_constraints', get_bond_constraints())
         
-        # using massspecgym data for training
-        if self.use_massspecgym_data:
-            self.train_info = load_massspecgym_data()
-        
+        self.train_info = DebugSpectrumDataset()
 
         self.reset()
         self._init_flag = True
 
     
     def random_massspecgym_data(self):
-        dataset_length = len(self.train_info)
-        self.current_data_index = np.random.randint(0, dataset_length)
-        sample = self.train_info.iloc[self.current_data_index]
-        
 
-        self.target_mzs = sample["mzs"]
-        self.target_ints = sample["intensities"]
+        sample = self.train_info.random_sample()
+        embeds = sample['embeds']
+        formula = sample['formulas']
         
-        smiles = None
-        formula = None
-        
-        smiles = sample["smiles"]
-        formula = sample["formula"]
-        
-        self.target_molecule = {
-            'smiles': smiles,
-            'formula': formula
+        self.target_spectrum = {
+            'embeds': embeds,
+            'formulas': formula
         }
+        self.smiles = sample['smiles']
 
+    
     def reset(self):
         """
         Reset the environment to its initial state.
@@ -339,47 +347,19 @@ class MassGymEnv(gym.Env):
         self.episode_length = 0
         self.current_selfies = ""
         self.bond_counts = []
-        self.current_mol = None
         self.episode_return = 0
         self._final_eval_reward = 0.0
         self.should_done = False
         
-        if self.use_massspecgym_data:
-            self.random_massspecgym_data()
-        else:
-            self.target_mzs = np.array([
-                15.0,   # CH3+ 甲基碎片
-                29.0,   # C2H5+ 乙基碎片
-                43.0,   # C3H7+ 丙基碎片
-                57.0,   # C4H9+ 丁基碎片
-                77.0,   # C6H5+ 苯基碎片
-                91.0,   # C7H7+ 苄基碎片
-                105.0,  # C8H9+ 甲基苯基碎片
-            ])
-            
-            self.target_ints = np.array([
-                0.3,    # CH3+ 中等强度
-                0.5,    # C2H5+ 较强
-                1.0,    # C3H7+ 基峰
-                0.8,    # C4H9+ 很强
-                0.4,    # C6H5+ 中等强度
-                0.6,    # C7H7+ 较强
-                0.2     # C8H9+ 弱峰
-            ])
-            
-            # 归一化强度
-            self.target_ints = self.target_ints / np.max(self.target_ints)
-            
-            self.target_molecule = {
-                'smiles': "CC1=CC=CC=C1C",  # 邻二甲苯
-                'formula': "C8H10"           # 分子式
-    }
+        self.random_massspecgym_data()
+        
 
         action_mask = self.get_valid_actions().astype(np.int8)
 
 
         obs_dict = {
-            'observation': self._encode_observation(),
+            'observation': self.target_spectrum['embeds'],
+            'prefix': self.current_selfies,
             'action_mask': action_mask,  
             'to_play': -1,
             'chance': self.chance
@@ -392,7 +372,7 @@ class MassGymEnv(gym.Env):
 
 
 
-    def _get_allowed_elements_from_formula(self, formula):
+    def _get_allowed_elements_from_formula(self):
         """
         Extract allowed elements from a formula and return a set of all variants
         
@@ -402,6 +382,8 @@ class MassGymEnv(gym.Env):
         Returns:
             set: The set of allowed element symbols, including all variants (with charges and different bond types)
         """
+        formula = self.target_spectrum.get('formulas')
+
         if formula is None:
             return set()
         
@@ -431,18 +413,19 @@ class MassGymEnv(gym.Env):
         }
     
         while i < len(formula):
-            # 处理两个字母的元素符号 (如 'Cl', 'Br')
+
             if i + 1 < len(formula) and formula[i].isupper() and formula[i+1].islower():
                 symbol = formula[i:i+2]
                 i += 2
-            # 处理单字母元素符号 (如 'C', 'H')
+            
             elif formula[i].isupper():
                 symbol = formula[i]
                 i += 1
-            # 跳过数字
+            
             elif formula[i].isdigit():
                 i += 1
                 continue
+            
             else:
                 i += 1
                 continue
@@ -474,8 +457,8 @@ class MassGymEnv(gym.Env):
 
         try:
             # Only filter if formula_masking is enabled and formula exists
-            if self.formula_masking and hasattr(self, 'target_molecule') and self.target_molecule.get('formula'):
-                formula = self.target_molecule.get('formula')
+            if self.formula_masking and hasattr(self, 'target_spectrum') and self.target_spectrum.get('formulas'):
+                formula = self.target_spectrum.get('formulas')
                 allowed_elements = self._get_allowed_elements_from_formula(formula)
                 for i, action in enumerate(self.actions_list):
                     if action in self.atom_tokens or action in self.bonded_atom_tokens:
@@ -500,7 +483,6 @@ class MassGymEnv(gym.Env):
         print(mask)
         print(">" *24)
         return mask
-
 
 
 
@@ -542,27 +524,16 @@ class MassGymEnv(gym.Env):
         if action_name == self.remove_token and len(self.bond_counts) == 0:
             raw_reward = -0.1
         else:
-            # Handle termination action
             if action_name == self.end_token:
                 done = True
                 self.should_done = True
-                if self.current_mol:
-                    fake_spectrum = {
-                        'mz_values': np.array([0]),
-                        'intensities': np.array([0])
-                    }
-                    raw_reward = self._cosine_similarity(
-                        fake_spectrum['mz_values'], 
-                        fake_spectrum['intensities'],
-                        self.target_mzs, 
-                        self.target_ints
-                    )
-                    info['smiles'] = Chem.MolToSmiles(self.current_mol)
-                    info['molecular_weight'] = MolWt(self.current_mol)
+                if self.current_selfies == sf.encoder(self.smiles):  #selfes to smiles
+                    raw_reward = 1.0
                 else:
                     raw_reward = 0.0
+
             # Handle atom addition
-            elif action_name in self.atom_tokens + self.bonded_atom_tokens:
+            elif action_name in self.actions_list:
                 new_selfies_candidate = self.current_selfies + action_name
                 valid_selfies = True
                 try:
@@ -585,25 +556,24 @@ class MassGymEnv(gym.Env):
             else:
                 raw_reward = -0.1
             
-            # Update the molecule
-            self.current_mol = self._selfies_to_mol(self.current_selfies)
-            
-            if self.current_mol:
-                molecule_size = len(self.bond_counts)
-                size_reward = 0.01 * molecule_size
-                fake_spectrum = {
-                    'mz_values': np.array([0]),
-                    'intensities': np.array([0])
-                }
-                similarity_reward = self._cosine_similarity(
-                    fake_spectrum['mz_values'],
-                    fake_spectrum['intensities'],
-                    self.target_mzs,
-                    self.target_ints
-                ) * 0.1
-                raw_reward = size_reward + similarity_reward
-            else:
-                raw_reward = -0.1
+            #TODO adding reward here
+
+            # if self.current_mol:
+            #     molecule_size = len(self.bond_counts)
+            #     size_reward = 0.01 * molecule_size
+            #     fake_spectrum = {
+            #         'mz_values': np.array([0]),
+            #         'intensities': np.array([0])
+            #     }
+            #     similarity_reward = self._cosine_similarity(
+            #         fake_spectrum['mz_values'],
+            #         fake_spectrum['intensities'],
+            #         self.target_mzs,
+            #         self.target_ints
+            #     ) * 0.1
+            #     raw_reward = size_reward + similarity_reward
+            # else:
+            #     raw_reward = -0.1
             
             self.episode_return += raw_reward
             self._final_eval_reward += raw_reward
@@ -612,7 +582,8 @@ class MassGymEnv(gym.Env):
                 done = True
         
         obs_dict = {
-            'observation': self._encode_observation(),
+            'observation': self.target_spectrum['embeds'],
+            'prefix': self.current_selfies,
             'action_mask': action_mask,
             'to_play': -1,
             'chance': self.chance
@@ -624,8 +595,8 @@ class MassGymEnv(gym.Env):
             reward = raw_reward
         
         info["raw_reward"] = raw_reward
-        if self.current_mol:
-            info["current_molecule"] = Chem.MolToSmiles(self.current_mol)
+        if self.current_selfies:
+            info["current_selfies"] = self.current_selfies
         
         if done:
             info['eval_episode_return'] = self._final_eval_reward
@@ -642,44 +613,6 @@ class MassGymEnv(gym.Env):
         reward = to_ndarray([float(raw_reward)], dtype=np.float32)
         
         return BaseEnvTimestep(obs_dict, reward, done, info)
-
-    def _encode_observation(self):
-        """
-        massspec information + current SELFIES
-        
-        Returns:
-        """
-        encoded_obs = np.zeros((self.max_len, self.vocab_size), dtype=np.float32)
-        
-        try:
-            tokens = list(sf.split_selfies(self.current_selfies)) if self.current_selfies else []
-            
-            for i, token in enumerate(tokens[:self.max_len]):
-                if token in self.vocab:
-                    token_idx = self.vocab.index(token)
-                else:
-                    token_idx = self.vocab.index("[nop]")
-                encoded_obs[i, token_idx] = 1
-            
-            nop_idx = self.vocab.index("[nop]")
-            for i in range(len(tokens), self.max_len):
-                encoded_obs[i, nop_idx] = 1
-                    
-        except Exception as e:
-            print(f"SELFIES encoding failed, return a zero array: {e}")
-            print(f"the problematic SELFIES: '{self.current_selfies}'")
-            nop_idx = self.vocab.index("[nop]")
-            for i in range(self.max_len):
-                encoded_obs[i, nop_idx] = 1
-            
-        if not self.channel_last:
-            encoded_obs = np.transpose(encoded_obs, [1, 0])
-        
-        if self.need_flatten:
-            encoded_obs = encoded_obs.reshape(-1)
-
-
-        return encoded_obs.astype(np.float32)
 
     
     def _implied_bond_order(self, token):
@@ -715,45 +648,11 @@ class MassGymEnv(gym.Env):
         """
         result = self._implied_bond_order(token)
         if result is None:
-            return 1  # 默认返回单键
+            return 1  
         order, _ = result
         return order
     
-    
-    def _selfies_to_mol(self, selfies_str):
-        """
-        Convert a SELFIES string to an RDKit molecule object.
-        
-        Args:
-            selfies_str (str): SELFIES string representation of molecule.
-            
-        Returns:
-            rdkit.Chem.rdchem.Mol: RDKit molecule object or None if conversion fails.
-        """
-        if not selfies_str:
-            return None
-
-        try:
-            smiles = sf.decoder(selfies_str)
-            mol = Chem.MolFromSmiles(smiles)
-            if mol:
-                try:
-                    Chem.SanitizeMol(mol, catchErrors=True)
-                except Exception as e:
-                    print(f"分子清理失败: {e}")
-                    print(f"问题的SMILES: {smiles}")
-                    return None
-                return mol
-            else:
-                print(f"从SMILES创建分子失败: {smiles}")
-                return None
-        except Exception as e:
-            print(f"SELFIES到SMILES转换失败: {e}")
-            print(f"问题的SELFIES: '{selfies_str}'")
-            return None
-
-    
-    
+    '''not use'''
     def _cosine_similarity(self, true_mzs, true_ints, pred_mzs, pred_ints):
         """
         Calculate the cosine similarity between two mass spectra.
@@ -855,13 +754,13 @@ class MassGymEnv(gym.Env):
         if mode == 'text_mode':
             s = 'current total reward: {}, '.format(self.episode_return)
             s += 'current SELFIES: {}\n'.format(self.current_selfies)
-            if self.current_mol:
-                s += 'SMILES: {}\n'.format(Chem.MolToSmiles(self.current_mol))
+            if self.smiles:
+                s += 'SMILES: {}\n'.format(self.smiles)
             else:
                 s += 'SMILES: (invalid molecule)\n'
             # print(s)
         elif mode == 'molecule_image_mode' or mode == 'image_savefile_mode':
-            if self.current_mol:
+            if self.smiles:
                 # use RDKit to render the molecule
                 img = Draw.MolToImage(self.current_mol, size=(300, 300))
                 
@@ -874,7 +773,7 @@ class MassGymEnv(gym.Env):
                 fnt = ImageFont.truetype(fnt_path, 12)
                 
                 # add SMILES information
-                smiles = Chem.MolToSmiles(self.current_mol)
+                smiles = self.smiles
                 draw.text((10, 310), f"SMILES: {smiles[:40]}", font=fnt, fill=(0, 0, 0))
                 if len(smiles) > 40:
                     draw.text((10, 330), f"{smiles[40:]}", font=fnt, fill=(0, 0, 0))
@@ -950,7 +849,7 @@ class MassGymEnv(gym.Env):
     
     @property
     def observation_space(self) -> gym.spaces.Space:
-        return self._observation_space
+        return self.target_spectrum['embeds'].shape[0]
     
     @property
     def action_space(self) -> gym.spaces.Space:
@@ -964,43 +863,11 @@ class MassGymEnv(gym.Env):
         """return the ID of the current player - for single-player environments, always return 0"""
         return 0
     
-    def get_selfies(self):
-        return self.current_selfies
-    
     def get_smiles(self):
-        if self.current_mol:
-            return Chem.MolToSmiles(self.current_mol)
+        if self.smiles:
+            return self.smiles
         return ""
-    
-    def observation(self):
-        print(self.legal_actions)
-        print(">")
-        obs = self._encode_observation()
-        
-        action_mask = np.zeros(len(self.actions_list), 'int8')
-        action_mask[self.legal_actions] = 1
 
-        
-        return {
-            'observation': obs,
-            'action_mask': action_mask,
-            'to_play': -1,
-            'chance': self.chance
-        }
-    
-    # def get_action_mask(self):
-    #     valid_mask = self.get_valid_actions()
-    #     action_mask = np.zeros(len(self.actions_list), dtype=np.int8)
-    #     action_mask[np.where(valid_mask)[0]] = 1
-    #     return action_mask
-    
-    def action_space_sample(self):
-        return np.random.randint(self.action_space.n)
-    
-    def is_current_smiles_valid(self):
-        """check if the current SELFIES string can be converted to a valid molecule"""
-        return self.current_mol is not None
-    
     @staticmethod
     def create_collector_env_cfg(cfg: dict) -> List[dict]:
         """create the collector environment configuration"""
@@ -1022,91 +889,4 @@ class MassGymEnv(gym.Env):
     def __repr__(self) -> str:
         return "LightZero MassSpec Env."
 
-    def _generate_realistic_spectrum(self):
-        """
-        Generate a realistic mass spectrum from common molecules.
-        
-        Returns:
-            bool: True if spectrum generation succeeded, False otherwise.
-        """
-        common_molecules = [
-            'C',           # 甲烷
-            'CC',          # 乙烷
-            'CCC',         # 丙烷
-            'CCCC',        # 丁烷
-            'O',           # 氧气分子
-            'N',           # 氮气分子
-            'CO',          # 一氧化碳
-            'CO2',         # 二氧化碳
-            'CCO',         # 乙醇
-            'C=O',         # 甲醛
-            'CC=O',        # 乙醛
-            'CC(=O)O',     # 乙酸
-            'CCN',         # 乙胺
-            'c1ccccc1',    # 苯
-            'Cc1ccccc1',   # 甲苯
-            'CC(=O)C',     # 丙酮
-            'OCC=O',       # 乙醛酸
-            'c1ccccc1O',   # 苯酚
-            'COC',         # 甲醚
-            'CCOC',        # 乙甲醚
-            'CCOCC',       # 二乙醚
-        ]
-        
-        try:
-            smiles = np.random.choice(common_molecules)
-            
-            mol = Chem.MolFromSmiles(smiles)
-            
-            if mol:
-                mw = int(round(MolWt(mol), 0))
-                
-                self.target_mzs = np.array([mw])
-                self.target_ints = np.array([1.0])
-                
-                self.target_molecule = {
-                    'smiles': smiles,
-                    'mol': mol,
-                    'molecular_weight': mw
-                }
-                
-                print(f"target molecule: {smiles}, molecular weight: {mw:.2f}")
-                return True
-            else:
-                print(f"failed to create molecule from SMILES: {smiles}")
-                return False
-        except Exception as e:
-            print(f"error generating realistic spectrum: {e}")
-            return False
-    
-    def _randomize_target_spectrum(self):
-        """
-        Generate a random target mass spectrum.
-        
-        This function creates a random spectrum with 1-4 peaks selected from common m/z values.
-        """
-        mz_options = [
-            14.0,   # CH2
-            16.0,   # O
-            28.0,   # CO
-            30.0,   # CH2O
-            44.0,   # CO2
-            46.0,   # C2H6O
-            58.0,   # C3H6O
-            78.0,   # C6H6
-            94.0    # C6H6O
-        ]
-        
-        num_peaks = np.random.randint(1, 4)
-        selected_mzs = np.random.choice(mz_options, size=num_peaks, replace=False)
-        
-        intensities = np.random.rand(num_peaks)
-        intensities = intensities / intensities.sum() 
-        
-
-        self.target_mzs = selected_mzs
-        self.target_ints = intensities
-        
-        print(f"randomized target spectrum: m/z = {self.target_mzs}, intensity = {self.target_ints}")
-    
     

@@ -37,8 +37,8 @@ massspecgym_gumbel_muzero_config = dict(
         reward_normalize=False,
         reward_norm_scale=1.0,
         reward_type='cosine_similarity',
-        max_len=20,
-        max_episode_steps=10,
+        max_len=100,
+        max_episode_steps=1000,
         channel_last=True,
         need_flatten=False,
 

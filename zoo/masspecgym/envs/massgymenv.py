@@ -384,6 +384,7 @@ class MassGymEnv(gym.Env):
         """
         formula = self.target_spectrum.get('formulas')
 
+
         if formula is None:
             return set()
         
@@ -445,6 +446,7 @@ class MassGymEnv(gym.Env):
         for variants in branch_variants.values():
             allowed_tokens.update(variants)
         
+
 
         return allowed_tokens
 

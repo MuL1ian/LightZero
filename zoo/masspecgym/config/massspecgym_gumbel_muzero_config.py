@@ -19,7 +19,7 @@ reanalyze_ratio = 0.
 
 
 massspecgym_gumbel_muzero_config = dict(
-    exp_name=f'data_muzero/massspecgym_gumbel_muzero_ns{num_simulations}_upc{update_per_collect}_rer{reanalyze_ratio}_seed0',
+    exp_name=f'data_muzero/massspecgym_gumbel_muzero_transformer_ns{num_simulations}_upc{update_per_collect}_rer{reanalyze_ratio}_seed0',
     env=dict(
         env_id='massgym',
         continuous=False,
@@ -33,12 +33,12 @@ massspecgym_gumbel_muzero_config = dict(
         replay_format='svg',
         replay_name_suffix='eval',
         replay_path=None,
-        obs_type='fingerprint',
+        obs_type='dict_encoded_selfies',
         reward_normalize=False,
         reward_norm_scale=1.0,
         reward_type='cosine_similarity',
-        max_len=100,
-        max_episode_steps=1000,
+        max_len=20,
+        max_episode_steps=10,
         channel_last=True,
         need_flatten=False,
 
@@ -53,17 +53,19 @@ massspecgym_gumbel_muzero_config = dict(
     ),
     policy=dict(
         model=dict(
-            observation_shape=1100, #
-            action_space_size=62,    # action size  
-            model_type='mlp',              
-            lstm_hidden_size=128,           
-            latent_state_dim=128,           
-            self_supervised_learning_loss=False,  
-            discrete_action_encoding_type='one_hot',
-            norm_type='LN',
-            fc_reward_size=64,
-            fc_value_size=64,
-            fc_policy_size=64,
+            model_type='mlp',
+            categorical_distribution=False,
+            observation_shape=4096,
+            action_space_size=62,
+            d_model=128,             # 直接在model字典中设置transformer参数
+            n_enc=4,
+            n_dec=6,
+            n_head=8,
+            dropout=0.1,
+            max_len=20,
+            state_norm=False,
+            self_supervised_learning_loss=False,
+            use_transformer=True,
         ),
         model_path=None,
         cuda=True,

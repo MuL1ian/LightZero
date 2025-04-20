@@ -211,7 +211,9 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             The user can define and use customized network model but must obey the same interface definition indicated \
             by import_names path. For MuZero, ``lzero.model.muzero_model.MuZeroModel``
         """
-        if self._cfg.model.model_type == "conv":
+        if hasattr(self._cfg.model, 'use_transformer') and self._cfg.model.use_transformer:
+            return 'MuZeroSelfiesTransformer', ['lzero.model.muzero_transformer']
+        elif self._cfg.model.model_type == "conv":
             return 'MuZeroModel', ['lzero.model.muzero_model']
         elif self._cfg.model.model_type == "mlp":
             return 'MuZeroModelMLP', ['lzero.model.muzero_model_mlp']
@@ -614,7 +616,7 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             self._mcts_eval = MCTSPtree(self._cfg)
 
     def _forward_eval(self, data: torch.Tensor, action_mask: list, to_play: List = [-1],
-                      ready_env_id: np.array = None, **kwargs) -> Dict:
+                      ready_env_id: np.array = None, prefix: List = None, **kwargs) -> Dict:
         """
         Overview:
             The forward function for evaluating the current policy in eval mode. Use model to execute MCTS search.
@@ -643,7 +645,12 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         output = {i: None for i in ready_env_id}
         with torch.no_grad():
             # data shape [B, S x C, W, H], e.g. {Tensor:(B, 12, 96, 96)}
-            network_output = self._collect_model.initial_inference(data)
+            if prefix is None:
+                network_output = self._collect_model.initial_inference(data)
+            else:
+                #TODO here is hard code
+                network_output = self._collect_model.initial_inference(data, prefix[0])
+
             latent_state_roots, reward_roots, pred_values, policy_logits = mz_network_output_unpack(network_output)
 
             if not self._eval_model.training:

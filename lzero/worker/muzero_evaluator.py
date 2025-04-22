@@ -244,8 +244,8 @@ class MuZeroEvaluator(ISerialEvaluator):
             action_mask_dict = {i: to_ndarray(init_obs[i]['action_mask']) for i in range(env_nums)}
             to_play_dict = {i: to_ndarray(init_obs[i]['to_play']) for i in range(env_nums)}
 
-            if 'prefix' in init_obs[0]:
-                prefix_dict = {i: to_ndarray(init_obs[i]['prefix']) for i in range(env_nums)}
+            # if 'prefix' in init_obs[0]:
+            #     prefix_dict = {i: to_ndarray(init_obs[i]['prefix']) for i in range(env_nums)}
 
             timestep_dict = {}
             for i in range(env_nums):
@@ -289,11 +289,11 @@ class MuZeroEvaluator(ISerialEvaluator):
                     to_play = [to_play_dict[env_id] for env_id in ready_env_id]
                     timestep = [timestep_dict[env_id] for env_id in ready_env_id]
 
-                    has_prefix = all(('prefix' in obs[env_id]) for env_id in ready_env_id)
+                    has_prefix = all('prefix' in obs[e] for e in ready_env_id)
                     if has_prefix:
-                        prefix_dict = {env_id: prefix_dict[env_id] for env_id in ready_env_id}
-                        prefix = [prefix_dict[env_id] for env_id in ready_env_id]
-     
+                        prefix_list = [ to_ndarray(obs[e]['prefix']) for e in ready_env_id ]
+                        prefix_np   = np.stack(prefix_list, axis=0)
+                        prefix_tensor = torch.from_numpy(prefix_np).long().to(self.policy_config.device)
 
                     stack_obs = to_ndarray(stack_obs)
                     stack_obs = prepare_observation(stack_obs, self.policy_config.model.model_type)
@@ -303,7 +303,7 @@ class MuZeroEvaluator(ISerialEvaluator):
                     # policy forward
                     # ==============================================================
                     if has_prefix:
-                        policy_output = self._policy.forward(stack_obs, action_mask, to_play, ready_env_id=ready_env_id, timestep=timestep, prefix=prefix)
+                        policy_output = self._policy.forward(stack_obs, action_mask, to_play, ready_env_id=ready_env_id, timestep=timestep, prefix=prefix_list)
                     else:
                         policy_output = self._policy.forward(stack_obs, action_mask, to_play, ready_env_id=ready_env_id, timestep=timestep)
 

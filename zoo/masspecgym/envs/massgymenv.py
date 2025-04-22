@@ -28,7 +28,7 @@ import warnings
 import torch
 import random
 from torch.utils.data import Dataset
-
+from zoo.masspecgym.envs.mass_tokenizers import SelfiesTokenizer
 
 
 class DebugSpectrumDataset(Dataset):
@@ -176,7 +176,7 @@ bond_constraints = get_bond_constraints()
 # Example of bond constraints: {'N': 3, 'O': 2, 'P': 3, 'H': 1, 'B': 3, 'Br': 1, 'S': 2, 'C': 4, 'Cl': 1, 'F': 1, 'I': 1}
 
 
-
+selfies_tokenizer = SelfiesTokenizer(max_len=100)
 
 
 
@@ -314,7 +314,17 @@ class MassGymEnv(gym.Env):
         self.current_selfies = ""
         self.bond_counts = []
         self.smiles = ""
-        
+
+
+        # initialize the tokenizer
+        self.tokenizer = selfies_tokenizer
+        action_token_ids = [ self.tokenizer.token_to_id(tok) for tok in self.actions_list ]
+        self.action_index2token_id = {
+            i: tid for i, tid in enumerate(action_token_ids)
+        }
+        self.token_id2action_index = {
+            tid: i for i, tid in enumerate(action_token_ids)
+        }
 
         self.bond_constraints = cfg.get('bond_constraints', get_bond_constraints())
         
@@ -345,13 +355,15 @@ class MassGymEnv(gym.Env):
             BaseEnvTimestep: Initial observation, reward, done flag, and info dictionary.
         """
         self.episode_length = 0
-        self.current_selfies = ""
+        self.current_selfies = " "
         self.bond_counts = []
         self.episode_return = 0
         self._final_eval_reward = 0.0
         self.should_done = False
         
         self.random_massspecgym_data()
+        self.token_ids = self._encode_selfies()
+
         
 
         action_mask = self.get_valid_actions().astype(np.int8)
@@ -359,7 +371,7 @@ class MassGymEnv(gym.Env):
 
         obs_dict = {
             'observation': self.target_spectrum['embeds'],
-            'prefix': self.current_selfies,
+            'prefix': self.token_ids,
             'action_mask': action_mask,  
             'to_play': -1,
             'chance': self.chance
@@ -371,6 +383,17 @@ class MassGymEnv(gym.Env):
         return BaseEnvTimestep(obs_dict, to_ndarray([0.0], dtype=np.float32), False, {})
 
 
+    def _encode_selfies(self):
+        """
+        Encode a SELFIES string into a list of token IDs.
+        
+        Returns:
+            Tensor: The token IDs of the SELFIES string.
+        """
+        token_ids = self.tokenizer.encode_selfies(self.current_selfies)
+        return torch.tensor(token_ids, dtype=torch.long)
+        
+        
 
     def _get_allowed_elements_from_formula(self):
         """
@@ -573,7 +596,8 @@ class MassGymEnv(gym.Env):
             #     raw_reward = size_reward + similarity_reward
             # else:
             #     raw_reward = -0.1
-            
+            self.token_ids = self._encode_selfies()
+
             self.episode_return += raw_reward
             self._final_eval_reward += raw_reward
             
@@ -582,7 +606,7 @@ class MassGymEnv(gym.Env):
         
         obs_dict = {
             'observation': self.target_spectrum['embeds'],
-            'prefix': self.current_selfies,
+            'prefix': self.token_ids,
             'action_mask': action_mask,
             'to_play': -1,
             'chance': self.chance

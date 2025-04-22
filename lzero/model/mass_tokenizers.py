@@ -21,6 +21,7 @@ class SpecialTokensBaseTokenizer(BaseTokenizer):
         self.eos_token = EOS_TOKEN
         self.unk_token = UNK_TOKEN
         self.max_length = max_len
+        self._tokenizer.add_tokens([ "<REMOVE>", "<END>" ])
 
         self.add_special_tokens([self.pad_token, self.sos_token, self.eos_token, self.unk_token])
 
@@ -28,6 +29,8 @@ class SpecialTokensBaseTokenizer(BaseTokenizer):
         self.sos_token_id = self.token_to_id(self.sos_token)
         self.eos_token_id = self.token_to_id(self.eos_token)
         self.unk_token_id = self.token_to_id(self.unk_token)
+        self.remove_token_id = self.token_to_id("<REMOVE>")
+        self.end_token_id    = self.token_to_id("<END>")
 
         self.enable_padding(
             direction="right",
@@ -83,10 +86,11 @@ if __name__ == "__main__":
     # 输入一个SELFIES字符串
     s = "[C][C][C][H][H]"
 
+    print(s)
     # 编码为 token ID 列表
     token_ids = tokenizer.encode_selfies(s)
     print("Token IDs:", token_ids)
 
     # 解码回 SELFIES
-    recovered_selfies = tokenizer.decode_to_selfies(token_ids)
-    print("Recovered SELFIES:", recovered_selfies)
+    # recovered_selfies = tokenizer.decode_to_selfies(token_ids)
+    # print("Recovered SELFIES:", recovered_selfies)

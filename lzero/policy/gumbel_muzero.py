@@ -616,7 +616,7 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             self._mcts_eval = MCTSPtree(self._cfg)
 
     def _forward_eval(self, data: torch.Tensor, action_mask: list, to_play: List = [-1],
-                      ready_env_id: np.array = None, prefix: List = None, **kwargs) -> Dict:
+                      ready_env_id: np.array = None, prefix: torch.Tensor = None, **kwargs) -> Dict:
         """
         Overview:
             The forward function for evaluating the current policy in eval mode. Use model to execute MCTS search.
@@ -648,8 +648,7 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             if prefix is None:
                 network_output = self._collect_model.initial_inference(data)
             else:
-                #TODO here is hard code
-                network_output = self._collect_model.initial_inference(data, prefix[0])
+                network_output = self._collect_model.initial_inference(data, prefix)
 
             latent_state_roots, reward_roots, pred_values, policy_logits = mz_network_output_unpack(network_output)
 
@@ -666,6 +665,8 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             else:
                 # python mcts_tree
                 roots = MCTSPtree.roots(active_eval_env_num, legal_actions)
+            
+
             roots.prepare_no_noise(reward_roots, list(pred_values), policy_logits, to_play)
             self._mcts_eval.search(roots, self._eval_model, latent_state_roots, to_play)
 

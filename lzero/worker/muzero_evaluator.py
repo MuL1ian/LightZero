@@ -295,6 +295,7 @@ class MuZeroEvaluator(ISerialEvaluator):
                         prefix_np   = np.stack(prefix_list, axis=0)
                         prefix_tensor = torch.from_numpy(prefix_np).long().to(self.policy_config.device)
 
+                        
                     stack_obs = to_ndarray(stack_obs)
                     stack_obs = prepare_observation(stack_obs, self.policy_config.model.model_type)
                     stack_obs = torch.from_numpy(stack_obs).to(self.policy_config.device).float()
@@ -303,7 +304,7 @@ class MuZeroEvaluator(ISerialEvaluator):
                     # policy forward
                     # ==============================================================
                     if has_prefix:
-                        policy_output = self._policy.forward(stack_obs, action_mask, to_play, ready_env_id=ready_env_id, timestep=timestep, prefix=prefix_list)
+                        policy_output = self._policy.forward(stack_obs, action_mask, to_play, ready_env_id=ready_env_id, timestep=timestep, prefix=prefix_tensor)
                     else:
                         policy_output = self._policy.forward(stack_obs, action_mask, to_play, ready_env_id=ready_env_id, timestep=timestep)
 

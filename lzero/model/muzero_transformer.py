@@ -6,7 +6,7 @@ from tokenizers import Tokenizer, processors, models
 from tokenizers.implementations import BaseTokenizer
 from typing import List, Tuple, Optional
 from ding.utils import MODEL_REGISTRY, SequenceType
-from .common import MZNetworkOutput
+# from .common import MZNetworkOutput
 
 # -----------------------------------------------------------------------------
 # Special-token constants
@@ -197,8 +197,8 @@ class MuZeroSelfiesTransformer(nn.Module):
         
         latent = new_prefix.unsqueeze(-1).unsqueeze(-1)
 
-        # return val, rew, pol, latent
-        return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=lat)
+        return val, rew, pol, latent
+        # return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=lat)
 
     def recurrent_inference(self, latent_state: torch.Tensor, action: torch.Tensor):
         prefix = latent_state.squeeze(-1).squeeze(-1)
@@ -210,8 +210,8 @@ class MuZeroSelfiesTransformer(nn.Module):
         
         latent = new_pref.unsqueeze(-1).unsqueeze(-1)
         
-        # return v, r, logits, latent
-        return MZNetworkOutput(value=v, reward=r, policy_logits=logits, latent_state=new_pref)
+        return v, r, logits, latent
+        # return MZNetworkOutput(value=v, reward=r, policy_logits=logits, latent_state=new_pref)
 
     def _pad_batch_prefix(self, prefix_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L = prefix_ids.shape
@@ -226,7 +226,7 @@ class MuZeroSelfiesTransformer(nn.Module):
 
 if __name__ == "__main__":
     # quick sanity check
-    prefix = torch.randint(0, 10, (1, 5))
+    prefix = torch.randint(0, 10, (1, 5)) # torch tensor of shape (1, 5) (B, Length)
     data   = torch.randn(4096)
     model  = MuZeroSelfiesTransformer()
     out = model.initial_inference(data, prefix)

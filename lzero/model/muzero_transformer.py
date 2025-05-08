@@ -12,9 +12,9 @@ from ding.utils import MODEL_REGISTRY, SequenceType
 # Special-token constants
 # -----------------------------------------------------------------------------
 PAD_TOKEN = "<pad>"
-SOS_TOKEN = "<s>"
-EOS_TOKEN = "</s>"
-UNK_TOKEN = "<unk>"
+SOS_TOKEN = ""
+EOS_TOKEN = "]"
+UNK_TOKEN = "]"
 
 class SpecialTokensBaseTokenizer(BaseTokenizer):
     def __init__(self, tokenizer: Tokenizer, max_len: int):
@@ -200,17 +200,67 @@ class MuZeroSelfiesTransformer(nn.Module):
         return val, rew, pol, latent
         # return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=lat)
 
+    def _representation(self, observation: torch.Tensor) -> torch.Tensor:
+        """
+        Overview:
+            Simply return the prefix as the latent state representation.
+            For molecule generation with SELFIES, the state is just the current sequence of tokens.
+        Arguments:
+            - observation (:obj:`torch.Tensor`): The current prefix of SELFIES tokens.
+        Returns:
+            - latent_state (:obj:`torch.Tensor`): The same prefix tensor.
+        """
+        return observation
+
+    def _dynamics(self, latent_state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Overview:
+            Concatenate the current prefix with the new token to get the next state.
+            For molecule generation with SELFIES, the dynamics is just appending the new token.
+        Arguments:
+            - latent_state (:obj:`torch.Tensor`): The current prefix of SELFIES tokens.
+            - action (:obj:`torch.Tensor`): The next token to append.
+        Returns:
+            - next_latent_state (:obj:`torch.Tensor`): The concatenated prefix with new token.
+            - reward (:obj:`torch.Tensor`): Zero reward tensor since we don't use rewards in this setting.
+        """
+        # Ensure action has the right shape for concatenation
+        action = action.unsqueeze(1) if action.dim() == 1 else action
+        
+        # Concatenate current prefix with new token
+        next_latent_state = torch.cat([latent_state, action], dim=1)
+        
+        # Create zero reward tensor with same batch size
+        reward = torch.zeros(latent_state.size(0), 1, device=latent_state.device)
+        
+        return next_latent_state, reward
+
     def recurrent_inference(self, latent_state: torch.Tensor, action: torch.Tensor):
-        prefix = latent_state.squeeze(-1).squeeze(-1)
-        new_pref = torch.cat([prefix, action.unsqueeze(1)], dim=1)
-        ids, mask = self._pad_batch_prefix(new_pref)
-        logits, val_raw = self.transformer(self.cached_spectrum, ids, mask)
-        v = val_raw.unsqueeze(-1)
-        r = torch.zeros_like(v)
+        """
+        Overview:
+            Perform recurrent inference using the simplified representation and dynamics.
+        Arguments:
+            - latent_state (:obj:`torch.Tensor`): The current prefix of SELFIES tokens.
+            - action (:obj:`torch.Tensor`): The next token to append.
+        Returns:
+            - value (:obj:`torch.Tensor`): Predicted value for the next state.
+            - reward (:obj:`torch.Tensor`): Zero reward tensor.
+            - policy_logits (:obj:`torch.Tensor`): Predicted policy logits for the next state.
+            - next_latent_state (:obj:`torch.Tensor`): The concatenated prefix with new token.
+        """
+        # Get next state and reward using dynamics
+        next_latent_state, reward = self._dynamics(latent_state, action)
         
-        latent = new_pref.unsqueeze(-1).unsqueeze(-1)
+        # Pad the new prefix for transformer input
+        ids, mask = self._pad_batch_prefix(next_latent_state)
         
-        return v, r, logits, latent
+        # Get predictions from transformer
+        logits, value = self.transformer(self.cached_spectrum, ids, mask)
+        
+        # Reshape value to match expected format
+        value = value.unsqueeze(-1)
+        
+        return value, reward, logits, next_latent_state
         # return MZNetworkOutput(value=v, reward=r, policy_logits=logits, latent_state=new_pref)
 
     def _pad_batch_prefix(self, prefix_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

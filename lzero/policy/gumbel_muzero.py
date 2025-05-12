@@ -669,6 +669,7 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             
 
             # roots.prepare_no_noise(reward_roots, list(pred_values), policy_logits, to_play)
+            # not clear if it works for batch
             roots.prepare_no_noise([reward_roots.item()], list(pred_values), policy_logits, to_play)
             self._mcts_eval.search(roots, self._eval_model, latent_state_roots, to_play)
 

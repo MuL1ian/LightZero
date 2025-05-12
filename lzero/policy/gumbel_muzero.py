@@ -538,6 +538,7 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
 
         with torch.no_grad():
             # data shape [B, S x C, W, H], e.g. {Tensor:(B, 12, 96, 96)}
+            # TODO: prefix missing, how to connect it with the dataset? 
             network_output = self._collect_model.initial_inference(data)
             latent_state_roots, reward_roots, pred_values, policy_logits = mz_network_output_unpack(network_output)
 

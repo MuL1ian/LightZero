@@ -667,7 +667,8 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
                 roots = MCTSPtree.roots(active_eval_env_num, legal_actions)
             
 
-            roots.prepare_no_noise(reward_roots, list(pred_values), policy_logits, to_play)
+            # roots.prepare_no_noise(reward_roots, list(pred_values), policy_logits, to_play)
+            roots.prepare_no_noise([reward_roots.item()], list(pred_values), policy_logits, to_play)
             self._mcts_eval.search(roots, self._eval_model, latent_state_roots, to_play)
 
             # list of list, shape: ``{list: batch_size} -> {list: action_space_size}``

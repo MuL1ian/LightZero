@@ -6,15 +6,15 @@ from tokenizers import Tokenizer, processors, models
 from tokenizers.implementations import BaseTokenizer
 from typing import List, Tuple, Optional
 from ding.utils import MODEL_REGISTRY, SequenceType
-# from .common import MZNetworkOutput
+from .common import MZNetworkOutput
 
 # -----------------------------------------------------------------------------
 # Special-token constants
 # -----------------------------------------------------------------------------
 PAD_TOKEN = "<pad>"
-SOS_TOKEN = ""
-EOS_TOKEN = "]"
-UNK_TOKEN = "]"
+SOS_TOKEN = "<s>"
+EOS_TOKEN = "</s>"
+UNK_TOKEN = "<unk>"
 
 class SpecialTokensBaseTokenizer(BaseTokenizer):
     def __init__(self, tokenizer: Tokenizer, max_len: int):
@@ -75,7 +75,7 @@ def pad_to_maxlen(ids: List[int], max_len: int, pad_id: int) -> Tuple[torch.Tens
 # Encoder-Decoder Transformer
 # -----------------------------------------------------------------------------
 class MassSelfiesED(nn.Module):
-    def __init__(self, vocab_size: int, d_model=512, n_enc=4, n_dec=6, n_head=8, dropout=0.1, device="cpu"):
+    def __init__(self, vocab_size: int, d_model=512, n_enc=4, n_dec=6, n_head=8, dropout=0.1, device="cuda"):
         super().__init__()
         self.device = torch.device(device)
         # Encoder for spectrum vector
@@ -97,6 +97,11 @@ class MassSelfiesED(nn.Module):
 
     def forward(self, spectrum_embed: torch.Tensor, tgt_tokens: torch.Tensor, tgt_mask: torch.Tensor):
         # spectrum_embed: (B,4096), tgt_tokens: (B,T), tgt_mask: (B,T)
+        spectrum_embed = spectrum_embed.to(self.device)
+        tgt_tokens = tgt_tokens.to(self.device)
+        tgt_mask = tgt_mask.to(self.device)
+
+
         B, T = tgt_tokens.shape
         # Encoder
         enc_feat = self.spec_proj(spectrum_embed)        # (B,d_model)
@@ -123,6 +128,7 @@ def step_prediction(model: MassSelfiesED, tokenizer: SelfiesTokenizer,
     model.eval()
     # determine device
     dev = device if device is not None else next(model.parameters()).device
+    spectrum_vec = spectrum_vec.to(dev)
     spec = spectrum_vec
     # ensure batch dim
     if spec.dim() == 1:
@@ -160,7 +166,7 @@ def step_prediction(model: MassSelfiesED, tokenizer: SelfiesTokenizer,
 class MuZeroSelfiesTransformer(nn.Module):
     def __init__(self, observation_shape=4096, max_len=128,
                  d_model=512, n_enc=4, n_dec=6, n_head=8,
-                 dropout=0.1, device='cpu', **kwargs):
+                 dropout=0.1, device='cuda', **kwargs):
         super().__init__()
         # tokenizer and transformer
         self.tok = SelfiesTokenizer(max_len=max_len)
@@ -197,8 +203,8 @@ class MuZeroSelfiesTransformer(nn.Module):
         
         latent = new_prefix.unsqueeze(-1).unsqueeze(-1)
 
-        return val, rew, pol, latent
-        # return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=lat)
+        # return val, rew, pol, latent
+        return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=lat)
 
     def _representation(self, observation: torch.Tensor) -> torch.Tensor:
         """
@@ -259,9 +265,12 @@ class MuZeroSelfiesTransformer(nn.Module):
         
         # Reshape value to match expected format
         value = value.unsqueeze(-1)
+
         
-        return value, reward, logits, next_latent_state
-        # return MZNetworkOutput(value=v, reward=r, policy_logits=logits, latent_state=new_pref)
+
+
+        # return value, reward, logits, next_latent_state
+        return MZNetworkOutput(value=value, reward=reward, policy_logits=logits, latent_state=next_latent_state)
 
     def _pad_batch_prefix(self, prefix_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L = prefix_ids.shape

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import selfies as sf
 from tokenizers import Tokenizer, processors, models
 from tokenizers.implementations import BaseTokenizer
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 from ding.utils import MODEL_REGISTRY, SequenceType
 from .common import MZNetworkOutput
 

@@ -362,6 +362,7 @@ class MuZeroCollector(ISerialCollector):
         action_mask_dict = {i: to_ndarray(init_obs[i]['action_mask']) for i in range(env_nums)}
         to_play_dict = {i: to_ndarray(init_obs[i]['to_play']) for i in range(env_nums)}
         timestep_dict = {}
+        prefix_dict = {i: to_ndarray(init_obs[i]['prefix']) for i in range(env_nums)}
         for i in range(env_nums):
             if 'timestep' not in init_obs[i]:
                 print(f"Warning: 'timestep' key is missing in init_obs[{i}], assigning value -1")
@@ -428,11 +429,13 @@ class MuZeroCollector(ISerialCollector):
                 action_mask_dict = {env_id: action_mask_dict[env_id] for env_id in ready_env_id}
                 to_play_dict = {env_id: to_play_dict[env_id] for env_id in ready_env_id}
                 timestep_dict = {env_id: timestep_dict[env_id] for env_id in ready_env_id}
+                prefix_dict = {env_id: prefix_dict[env_id] for env_id in ready_env_id}
                 
                 action_mask = [action_mask_dict[env_id] for env_id in ready_env_id]
                 to_play = [to_play_dict[env_id] for env_id in ready_env_id]
                 timestep = [timestep_dict[env_id] for env_id in ready_env_id]
-                
+                prefix = np.array([prefix_dict[env_id] for env_id in ready_env_id])
+                prefix = torch.from_numpy(prefix).to(self.policy_config.device)
                 if self.policy_config.use_ture_chance_label_in_chance_encoder:
                     chance_dict = {env_id: chance_dict[env_id] for env_id in ready_env_id}
 
@@ -445,7 +448,16 @@ class MuZeroCollector(ISerialCollector):
                 # Key policy forward step
                 # ==============================================================
                 # print(f'ready_env_id:{ready_env_id}')
-                policy_output = self._policy.forward(stack_obs, action_mask, temperature, to_play, epsilon, ready_env_id=ready_env_id, timestep=timestep)
+                policy_output = self._policy.forward(
+                    stack_obs, 
+                    action_mask, 
+                    temperature, 
+                    to_play, 
+                    epsilon, 
+                    ready_env_id=ready_env_id, 
+                    timestep=timestep,
+                    prefix=prefix
+                )
 
                 # Extract relevant policy outputs
                 actions_with_env_id = {k: v['action'] for k, v in policy_output.items()}

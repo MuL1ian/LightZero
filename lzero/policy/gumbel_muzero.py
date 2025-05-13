@@ -502,6 +502,7 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             to_play: List = [-1],
             epsilon: float = 0.25,
             ready_env_id: np.array = None,
+            prefix: torch.Tensor = None,
             **kwargs,
     ) -> Dict:
         """
@@ -537,9 +538,15 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         output = {i: None for i in ready_env_id}
 
         with torch.no_grad():
-            # data shape [B, S x C, W, H], e.g. {Tensor:(B, 12, 96, 96)}
-            # TODO: prefix missing, how to connect it with the dataset? 
-            network_output = self._collect_model.initial_inference(data)
+            if prefix is None:
+                network_output = self._collect_model.initial_inference(data)
+            else:
+                print('这里有prefix 应该走这个')
+                print(type(prefix))
+                print(prefix.shape)
+                print("HERE")
+               
+                network_output = self._collect_model.initial_inference(data, prefix)
             latent_state_roots, reward_roots, pred_values, policy_logits = mz_network_output_unpack(network_output)
 
             pred_values = self.inverse_scalar_transform_handle(pred_values).detach().cpu().numpy()
@@ -559,6 +566,14 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
                 # python mcts_tree
                 roots = MCTSPtree.roots(active_collect_env_num, legal_actions)
 
+            # TODO what the reward_roots shape?
+            # TODO require的好像是list 而不是tensor？
+            print(f'type(reward_roots):{type(reward_roots)}')
+            print(f'reward_roots.shape:{reward_roots.shape}')
+
+            print(f'pred_values:{pred_values}')
+            print(f'type(pred_values):{type(pred_values)}')
+            
             roots.prepare(self._cfg.root_noise_weight, noises, reward_roots, list(pred_values), policy_logits, to_play)
             self._mcts_collect.search(roots, self._collect_model, latent_state_roots, to_play)
 
@@ -652,7 +667,10 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
                 network_output = self._collect_model.initial_inference(data, prefix)
 
             latent_state_roots, reward_roots, pred_values, policy_logits = mz_network_output_unpack(network_output)
-
+            print('in forward eval')
+            print(f'reward_roots:{reward_roots}')
+            print(f'type(reward_roots):{type(reward_roots)}')
+            print(f'reward_roots.shape:{reward_roots.shape}')
             if not self._eval_model.training:
                 # if not in training, obtain the scalars of the value/reward
                 pred_values = self.inverse_scalar_transform_handle(pred_values).detach().cpu().numpy()  # shape（B, 1）

@@ -859,6 +859,8 @@ class MassGymEnv(gym.Env):
         logging.info("save render output to {}".format(filename))
         self.frames = []
     
+
+
     # def random_action(self) -> np.ndarray:
     #     """return a random legal action"""
     #     legal = self.legal_actions

@@ -62,8 +62,8 @@ class MassGymLightZeroEnv(gym.Wrapper):
         observation = self._process_observation_for_mlp(obs['observation'])
         action_mask = obs['action_mask']
 
-        print("------wrapper step-----")
-        print(obs['prefix'])
+        # print("------wrapper step-----")
+        # print(obs['prefix'])
 
         lightzero_obs = {
             'observation': observation,

@@ -301,9 +301,11 @@ class MassGymEnv(gym.Env):
         self.max_len = cfg.get('max_len', 100)
         
         
+        
         self.episode_return = 0
         self.episode_length = 0
         self.should_done = False
+        self._timestep = 0
 
         # set the action space and observation space for the gym interface
         self._action_space = spaces.Discrete(len(self.actions_list))
@@ -363,6 +365,7 @@ class MassGymEnv(gym.Env):
         
         self.random_massspecgym_data()
         self.token_ids = self._encode_selfies()
+        self._timestep = 0
 
         
 
@@ -386,7 +389,8 @@ class MassGymEnv(gym.Env):
             'observation': combined_obs, # bacth * 4196 (4096 + 100) 4096 for spectrum, 100 for token ids
             'action_mask': action_mask,  
             'to_play': -1,
-            'chance': self.chance
+            'chance': self.chance,
+            'timestep': self._timestep
         }
         
         if self.render_mode is not None:
@@ -554,6 +558,7 @@ class MassGymEnv(gym.Env):
         raw_reward = 0.0
         info = {}
         done = False
+        self._timestep += 1
         
         if action_name == self.remove_token and len(self.bond_counts) == 0:
             raw_reward = -0.1
@@ -630,7 +635,8 @@ class MassGymEnv(gym.Env):
             'observation': combined_obs,
             'action_mask': action_mask,
             'to_play': -1,
-            'chance': self.chance
+            'chance': self.chance,
+            'timestep': self._timestep
         }
         
         if self.reward_normalize:

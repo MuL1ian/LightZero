@@ -78,15 +78,24 @@ class MassSelfiesED(nn.Module):
     def __init__(self, vocab_size: int, d_model=512, n_enc=4, n_dec=6, n_head=8, dropout=0.1, device="cpu"):
         super().__init__()
         self.device = torch.device(device)
+        self.spectrum_dim = 4096  # record spectrum dimension
+        
         # Encoder for spectrum vector
-        self.spec_proj = nn.Sequential(nn.Linear(4096, d_model), nn.ReLU(), nn.Dropout(dropout))
+        self.spec_proj = nn.Sequential(nn.Linear(self.spectrum_dim, d_model), nn.ReLU(), nn.Dropout(dropout)) 
+
         enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, dropout=dropout, batch_first=True)
+
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_enc)
+
         # Decoder for token sequence
         self.token_embed = nn.Embedding(vocab_size, d_model)
+
         self.pos_embed   = nn.Embedding(1024, d_model)
+
         dec_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=n_head, dropout=dropout, batch_first=True)
-        self.decoder   = nn.TransformerDecoder(dec_layer, num_layers=n_dec)
+
+        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_dec)
+
         # Output heads
         self.action_head = nn.Linear(d_model, vocab_size, bias=False)
         self.value_head  = nn.Sequential(nn.Linear(d_model, d_model), nn.Tanh(), nn.Linear(d_model, 1))
@@ -95,17 +104,26 @@ class MassSelfiesED(nn.Module):
     def _generate_square_subsequent_mask(self, sz: int) -> torch.Tensor:
         return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
 
-    def forward(self, spectrum_embed: torch.Tensor, tgt_tokens: torch.Tensor, tgt_mask: torch.Tensor):
-        # spectrum_embed: (B,4096), tgt_tokens: (B,T), tgt_mask: (B,T)
+    def forward(self, combined_embed: torch.Tensor, tgt_tokens: torch.Tensor, tgt_mask: torch.Tensor):
+        """
+        combined_embed: (B, spectrum_dim + prefix_len)
+        tgt_tokens:     (B, T)  token IDs of prefix
+        tgt_mask:       (B, T)  padding mask
+        """
+
+        # split spectrum and prefix
+        spectrum_embed = combined_embed[:, :self.spectrum_dim]  # (B, spectrum_dim)
+
+        tgt_tokens = tgt_tokens.long()
         spectrum_embed = spectrum_embed.to(self.device)
         tgt_tokens = tgt_tokens.to(self.device)
         tgt_mask = tgt_mask.to(self.device)
-
 
         B, T = tgt_tokens.shape
         # Encoder
         enc_feat = self.spec_proj(spectrum_embed)        # (B,d_model)
         mem      = self.encoder(enc_feat.unsqueeze(1))   # (B,1,d_model)
+        
         # Decoder
         pos_ids  = torch.arange(T, device=tgt_tokens.device).unsqueeze(0)
         dec_in   = self.token_embed(tgt_tokens) + self.pos_embed(pos_ids)
@@ -122,47 +140,40 @@ class MassSelfiesED(nn.Module):
 # Greedy step prediction helper
 # -----------------------------------------------------------------------------
 @torch.no_grad()
-def step_prediction(model: MassSelfiesED, tokenizer: SelfiesTokenizer,
-                    spectrum_vec: torch.Tensor, prefix_selfies: Optional[torch.Tensor]=None,
-                    device: Optional[str]=None):
-
-    print(f"step_prediction - spec shape: {spectrum_vec.shape if hasattr(spectrum_vec, 'shape') else 'not a tensor'}")
-    print(f"step_prediction - prefix shape: {prefix_selfies.shape if hasattr(prefix_selfies, 'shape') else 'not a tensor'}")
-
+def step_prediction(model: MassSelfiesED,
+                   tokenizer: SelfiesTokenizer,
+                   combined_vec: torch.Tensor,
+                   device: Optional[str]=None):
+    """Single-step greedy prediction"""
     model.eval()
-    # determine device
-    dev = device if device is not None else next(model.parameters()).device
-    spectrum_vec = spectrum_vec.to(dev)
-    spec = spectrum_vec
-    # ensure batch dim
-    if spec.dim() == 1:
-        spec = spec.unsqueeze(0)
-    spec = spec.to(dev)
-    # process prefix IDs
-    if prefix_selfies is not None:
-        ps = prefix_selfies
-        if ps.dim() == 2:
-            ps = ps.squeeze(0)
-        current_ids = [tokenizer.sos_token_id] + ps.tolist()
-    else:
-        current_ids = [tokenizer.sos_token_id]
+    dev = device or next(model.parameters()).device
+    vec = combined_vec.to(dev)
+    if vec.dim() == 1:
+        vec = vec.unsqueeze(0)
+
+    # extract prefix IDs from embedded vec
+    prefix_ids = vec[:, model.spectrum_dim:].long()  # (B, prefix_len)
+
+    # rebuild token sequence
+    ids_list = [[tokenizer.sos_token_id] + row.tolist() for row in prefix_ids]
     # pad and mask
-    max_len = tokenizer.max_length or 64
-    ids, mask = pad_to_maxlen(current_ids, max_len, tokenizer.pad_token_id)
-    ids  = ids.unsqueeze(0).to(dev)
-    mask = mask.unsqueeze(0).to(dev)
-    print(f"Before model call - spec shape: {spectrum_vec.shape}")
-    print(f"Before model call - ids shape: {ids.shape}")
-    print(f"Before model call - mask shape: {mask.shape}")
+    max_len = tokenizer.max_length
+    ids_batch = []
+    mask_batch = []
+    for seq in ids_list:
+        ids_pad, m = pad_to_maxlen(seq, max_len, tokenizer.pad_token_id)
+        ids_batch.append(ids_pad)
+        mask_batch.append(m)
+    ids = torch.stack(ids_batch,  dim=0).to(dev)  # (B,T)
+    mask = torch.stack(mask_batch, dim=0).to(dev)  # (B,T)
     # forward
-    logits, value = model(spec, ids, mask)
-    # greedy select one token
-    next_id = torch.argmax(logits[0]).item()
+    logits, value = model(vec, ids, mask)
+    next_id = torch.argmax(logits, dim=-1)[0].item()
     return {
-        'logits': logits.squeeze(0),      # (vocab_size,)
-        'value':  value.detach(),          # (B,) tensor
+        'logits': logits.squeeze(0),
+        'value':  value, 
         'probs':  F.softmax(logits, dim=-1).squeeze(0).cpu().numpy(),
-        'current_prefix': current_ids,
+        'current_prefix': ids_list[0],
         'next_token_id': next_id,
     }
 
@@ -176,6 +187,7 @@ class MuZeroSelfiesTransformer(nn.Module):
                  dropout=0.1, device='cpu', **kwargs):
         super().__init__()
         # tokenizer and transformer
+        self.spectrum_dim = observation_shape
         self.tok = SelfiesTokenizer(max_len=max_len)
         vocab_size = len(self.tok.get_vocab())
         self.transformer = MassSelfiesED(vocab_size=vocab_size,
@@ -186,32 +198,65 @@ class MuZeroSelfiesTransformer(nn.Module):
         self.to(self.device)
         self.cached_spectrum = None
 
-    def initial_inference(self, obs: torch.Tensor, prefix: torch.Tensor):
-        # ensure batch dim for obs
-        spec = obs if obs.dim()==2 else obs.unsqueeze(0)
-        self.cached_spectrum = spec.to(self.device)
-        B = spec.size(0)
-        # one-step prediction
-        pred = step_prediction(self.transformer, self.tok, spec, prefix, device=self.device)
+    # def initial_inference(self, obs: torch.Tensor):
+    #     # ensure batch dim for obs
+    #     spec = obs if obs.dim()==2 else obs.unsqueeze(0)
+    #     self.cached_spectrum = spec.to(self.device)
+    #     B = spec.size(0)
+    #     # one-step prediction
+    #     pred = step_prediction(self.transformer, self.tok, spec, device=self.device)
 
-        # value: shape (B,1)
-        val = pred['value']
-        val = val.unsqueeze(-1) if val.dim()==1 else val
-        val = val.expand(B, 1)
-        # reward: (B,1)
-        # rew = torch.zeros_like(val)
-        rew = [0. for _ in range(val.shape[0])] 
-        # policy_logits: (B, action_dim)
-        pol = pred['logits'].unsqueeze(0).expand(B, -1)
+    #     # value: shape (B,1)
+    #     val = pred['value']
+    #     val = val.unsqueeze(-1) if val.dim()==1 else val
+    #     val = val.expand(B, 1)
+    #     # reward: (B,1)
+    #     # rew = torch.zeros_like(val)
+    #     rew = [0. for _ in range(val.shape[0])] 
+    #     # policy_logits: (B, action_dim)
+    #     pol = pred['logits'].unsqueeze(0).expand(B, -1)
         
-        # latent_state: prefix IDs should be (B,H)
-        next_token = torch.argmax(pol, dim=1, keepdim=True)
-        lat = prefix if prefix.dim()==2 else prefix.unsqueeze(0)
-        # new_prefix = torch.cat([lat, next_token], dim=1)
+    #     prefix = obs[:, self.spectrum_dim:]
+    #     # latent_state: prefix IDs should be (B,H)
+    #     next_token = torch.argmax(pol, dim=1, keepdim=True)
+    #     lat = prefix if prefix.dim()==2 else prefix.unsqueeze(0)
+    #     # new_prefix = torch.cat([lat, next_token], dim=1)
         
-        # latent = new_prefix.unsqueeze(-1).unsqueeze(-1)
+    #     # latent = new_prefix.unsqueeze(-1).unsqueeze(-1)
 
-        # return val, rew, pol, latent
+    #     # return val, rew, pol, latent
+    #     return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=lat)
+    def initial_inference(self, obs: torch.Tensor):
+
+        vec = obs if obs.dim()==2 else obs.unsqueeze(0)
+        self.cached_spectrum = vec.to(self.device)
+
+        B = vec.size(0)
+
+
+        pred = step_prediction(self.transformer, self.tok, vec, device=self.device)
+
+        # print("================")
+        # print(pred['logits'].shape) # (B, vocab_size)
+        # print(pred['value'].shape) # (B)
+        # print(pred['probs'].shape) # (B, vocab_size)
+        # print("================")
+        val = pred['value'].unsqueeze(-1).expand(B, 1)
+
+
+        pol = pred['logits']
+
+
+        rew = [0.0] * B
+
+        prefix = vec[:, self.spectrum_dim:]
+        next_token = torch.argmax(pred['logits'], dim=1, keepdim=True)
+
+        #TODO latent_state  be next prefix or current prefix
+        new_prefix = torch.cat([prefix, next_token], dim=1)
+
+        lat = new_prefix
+
         return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=lat)
 
     def _representation(self, observation: torch.Tensor) -> torch.Tensor:
@@ -274,9 +319,6 @@ class MuZeroSelfiesTransformer(nn.Module):
         # Reshape value to match expected format
         value = value.unsqueeze(-1)
 
-        
-
-
         # return value, reward, logits, next_latent_state
         return MZNetworkOutput(value=value, reward=reward, policy_logits=logits, latent_state=next_latent_state)
 
@@ -293,9 +335,8 @@ class MuZeroSelfiesTransformer(nn.Module):
 
 if __name__ == "__main__":
     # quick sanity check
-    prefix = torch.randint(0, 10, (1, 5)) # torch tensor of shape (1, 5) (B, Length)
-    data   = torch.randn(4096)
+    data   = torch.randn(4196)
     model  = MuZeroSelfiesTransformer()
-    out = model.initial_inference(data, prefix)
+    out = model.initial_inference(data)
     print([t.shape for t in (out[0], out[1], out[2], out[3])])
     print(out)

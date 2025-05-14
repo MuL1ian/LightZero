@@ -566,13 +566,6 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
                 # python mcts_tree
                 roots = MCTSPtree.roots(active_collect_env_num, legal_actions)
 
-            # TODO what the reward_roots shape?
-            # TODO require的好像是list 而不是tensor？
-            print(f'type(reward_roots):{type(reward_roots)}')
-            print(f'reward_roots.shape:{reward_roots.shape}')
-
-            print(f'pred_values:{pred_values}')
-            print(f'type(pred_values):{type(pred_values)}')
             
             roots.prepare(self._cfg.root_noise_weight, noises, reward_roots, list(pred_values), policy_logits, to_play)
             self._mcts_collect.search(roots, self._collect_model, latent_state_roots, to_play)
@@ -667,10 +660,6 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
                 network_output = self._collect_model.initial_inference(data, prefix)
 
             latent_state_roots, reward_roots, pred_values, policy_logits = mz_network_output_unpack(network_output)
-            print('in forward eval')
-            print(f'reward_roots:{reward_roots}')
-            print(f'type(reward_roots):{type(reward_roots)}')
-            print(f'reward_roots.shape:{reward_roots.shape}')
             if not self._eval_model.training:
                 # if not in training, obtain the scalars of the value/reward
                 pred_values = self.inverse_scalar_transform_handle(pred_values).detach().cpu().numpy()  # shape（B, 1）
@@ -686,9 +675,9 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
                 roots = MCTSPtree.roots(active_eval_env_num, legal_actions)
             
 
-            # roots.prepare_no_noise(reward_roots, list(pred_values), policy_logits, to_play)
+            roots.prepare_no_noise(reward_roots, list(pred_values), policy_logits, to_play)
             # not clear if it works for batch
-            roots.prepare_no_noise([reward_roots.item()], list(pred_values), policy_logits, to_play)
+            # roots.prepare_no_noise([reward_roots.item()], list(pred_values), policy_logits, to_play)
             self._mcts_eval.search(roots, self._eval_model, latent_state_roots, to_play)
 
             # list of list, shape: ``{list: batch_size} -> {list: action_space_size}``

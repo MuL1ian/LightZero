@@ -75,7 +75,7 @@ def pad_to_maxlen(ids: List[int], max_len: int, pad_id: int) -> Tuple[torch.Tens
 # Encoder-Decoder Transformer
 # -----------------------------------------------------------------------------
 class MassSelfiesED(nn.Module):
-    def __init__(self, vocab_size: int, d_model=512, n_enc=4, n_dec=6, n_head=8, dropout=0.1, device="cuda"):
+    def __init__(self, vocab_size: int, d_model=512, n_enc=4, n_dec=6, n_head=8, dropout=0.1, device="cpu"):
         super().__init__()
         self.device = torch.device(device)
         # Encoder for spectrum vector
@@ -125,6 +125,10 @@ class MassSelfiesED(nn.Module):
 def step_prediction(model: MassSelfiesED, tokenizer: SelfiesTokenizer,
                     spectrum_vec: torch.Tensor, prefix_selfies: Optional[torch.Tensor]=None,
                     device: Optional[str]=None):
+
+    print(f"step_prediction - spec shape: {spectrum_vec.shape if hasattr(spectrum_vec, 'shape') else 'not a tensor'}")
+    print(f"step_prediction - prefix shape: {prefix_selfies.shape if hasattr(prefix_selfies, 'shape') else 'not a tensor'}")
+
     model.eval()
     # determine device
     dev = device if device is not None else next(model.parameters()).device
@@ -147,6 +151,9 @@ def step_prediction(model: MassSelfiesED, tokenizer: SelfiesTokenizer,
     ids, mask = pad_to_maxlen(current_ids, max_len, tokenizer.pad_token_id)
     ids  = ids.unsqueeze(0).to(dev)
     mask = mask.unsqueeze(0).to(dev)
+    print(f"Before model call - spec shape: {spectrum_vec.shape}")
+    print(f"Before model call - ids shape: {ids.shape}")
+    print(f"Before model call - mask shape: {mask.shape}")
     # forward
     logits, value = model(spec, ids, mask)
     # greedy select one token
@@ -166,7 +173,7 @@ def step_prediction(model: MassSelfiesED, tokenizer: SelfiesTokenizer,
 class MuZeroSelfiesTransformer(nn.Module):
     def __init__(self, observation_shape=4096, max_len=128,
                  d_model=512, n_enc=4, n_dec=6, n_head=8,
-                 dropout=0.1, device='cuda', **kwargs):
+                 dropout=0.1, device='cpu', **kwargs):
         super().__init__()
         # tokenizer and transformer
         self.tok = SelfiesTokenizer(max_len=max_len)
@@ -192,16 +199,17 @@ class MuZeroSelfiesTransformer(nn.Module):
         val = val.unsqueeze(-1) if val.dim()==1 else val
         val = val.expand(B, 1)
         # reward: (B,1)
-        rew = torch.zeros_like(val)
+        # rew = torch.zeros_like(val)
+        rew = [0. for _ in range(val.shape[0])] 
         # policy_logits: (B, action_dim)
         pol = pred['logits'].unsqueeze(0).expand(B, -1)
         
         # latent_state: prefix IDs should be (B,H)
         next_token = torch.argmax(pol, dim=1, keepdim=True)
         lat = prefix if prefix.dim()==2 else prefix.unsqueeze(0)
-        new_prefix = torch.cat([lat, next_token], dim=1)
+        # new_prefix = torch.cat([lat, next_token], dim=1)
         
-        latent = new_prefix.unsqueeze(-1).unsqueeze(-1)
+        # latent = new_prefix.unsqueeze(-1).unsqueeze(-1)
 
         # return val, rew, pol, latent
         return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=lat)

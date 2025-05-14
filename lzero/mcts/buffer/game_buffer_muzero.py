@@ -448,7 +448,9 @@ class MuZeroGameBuffer(GameBuffer):
                 end_index = self._cfg.mini_infer_size * (i + 1)
                 m_obs = torch.from_numpy(value_obs_list[beg_index:end_index]).to(self._cfg.device)
                 # calculate the target value
-                m_output = model.initial_inference(m_obs)
+                # TODO 这里inital inference要prefix怎么处理，现在是dummy处理方式
+                empty_prefix = None
+                m_output = model.initial_inference(m_obs, empty_prefix)
 
                 if not model.training:
                     # if not in training, obtain the scalars of the value/reward

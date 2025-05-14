@@ -286,7 +286,10 @@ class MuZeroEvaluator(ISerialEvaluator):
                     timestep = [timestep_dict[env_id] for env_id in ready_env_id]
 
                     stack_obs = to_ndarray(stack_obs)
-                    stack_obs = prepare_observation(stack_obs, self.policy_config.model.model_type)
+                    if hasattr(self.policy_config.model, 'use_transformer') and self.policy_config.model.use_transformer:
+                        stack_obs = prepare_observation(stack_obs, 'transformer')
+                    else:
+                        stack_obs = prepare_observation(stack_obs, self.policy_config.model.model_type)
                     stack_obs = torch.from_numpy(stack_obs).to(self.policy_config.device).float()
 
                     # ==============================================================

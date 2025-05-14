@@ -211,7 +211,9 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             The user can define and use customized network model but must obey the same interface definition indicated \
             by import_names path. For MuZero, ``lzero.model.muzero_model.MuZeroModel``
         """
-        if self._cfg.model.model_type == "conv":
+        if hasattr(self._cfg.model, 'use_transformer') and self._cfg.model.use_transformer:
+            return 'MuZeroSelfiesTransformer', ['lzero.model.muzero_transformer']
+        elif self._cfg.model.model_type == "conv":
             return 'MuZeroModel', ['lzero.model.muzero_model']
         elif self._cfg.model.model_type == "mlp":
             return 'MuZeroModelMLP', ['lzero.model.muzero_model_mlp']

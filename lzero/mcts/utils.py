@@ -90,6 +90,10 @@ def prepare_observation(observation_list, model_type='conv'):
         [B, S, O] -> [B, S x O]
         where B is batch size, S is stack num, O is obs shape.
 
+    For model_type='transformer':
+        [B, S, O] -> [B, O]
+        where B is batch size, S is stack num, O is obs shape.
+
     Arguments:
         - observation_list (List): list of observations.
         - model_type (str): type of the model. (default is 'conv')
@@ -97,7 +101,7 @@ def prepare_observation(observation_list, model_type='conv'):
     Returns:
         - np.ndarray: Reshaped array of observations.
     """
-    assert model_type in ['conv', 'mlp', 'conv_context', 'mlp_context'], "model_type must be either 'conv' or 'mlp'"
+    assert model_type in ['conv', 'mlp', 'conv_context', 'mlp_context', 'transformer'], "model_type must be either 'conv' or 'mlp' or 'transformer'"
     observation_array = np.array(observation_list)
     batch_size = observation_array.shape[0]
 
@@ -116,6 +120,8 @@ def prepare_observation(observation_list, model_type='conv'):
             observation_array = observation_array.reshape(batch_size, -1)
         else:
             raise ValueError("For 'mlp' model_type, the observation must have 3 dimensions [B, S, O]")
+    elif model_type in ['transformer']:
+        pass
 
     return observation_array
 

@@ -147,8 +147,8 @@ def split_atoms(atom_tokens):
     branch_tokens = []
     ring_tokens = []
 
-    default_branch = {"[Branch1]", "[Branch2]", "[Branch3]"}
-    default_ring = {"[Ring1]", "[Ring2]", "[Ring3]"}
+    default_branch = {"[Branch1]", "[Branch2]", "[Branch3]", "[#Branch1]", "[#Branch2]", "[#Branch3]", "[=Branch1]", "[=Branch2]", "[=Branch3]"}
+    default_ring = {"[Ring1]", "[Ring2]", "[Ring3]", "[=Ring1]", "[=Ring2]", "[=Ring3]"}
 
     for token in atom_tokens:
         if token in default_branch:
@@ -261,45 +261,52 @@ class MassGymEnv(gym.Env):
         self.target_embeds = cfg.get('target_spectrum', {}).get('embeds', [])
         self.target_formula = cfg.get('target_spectrum', {}).get('formulas', '')
         
-        use_all_tokens = cfg.get('use_all_atom_tokens', False)
-         
-        if use_all_tokens:
-            all_atom_tokens = sf.get_semantic_robust_alphabet()
-            
-            atom_tokens, bonded_atom_tokens, branch_tokens, ring_tokens = split_atoms(all_atom_tokens)
-            
-            use_branch = cfg.get('use_branch_tokens', True)
-            use_ring = cfg.get('use_ring_tokens', True)
-            
-            self.atom_tokens = filter_valid_atoms(atom_tokens)
-            self.bonded_atom_tokens = bonded_atom_tokens
-            self.branch_tokens = branch_tokens if use_branch else []
-            self.ring_tokens = ring_tokens if use_ring else []
-            
-        else:
-            self.atom_tokens = cfg.get('atom_tokens', [])
-            self.bonded_atom_tokens = cfg.get('bonded_atom_tokens', [])
-            self.branch_tokens = cfg.get('branch_tokens', [])
-            self.ring_tokens = cfg.get('ring_tokens', [])
+        # initialize the tokenizer
+        self.tokenizer = selfies_tokenizer
         
+        # get the semantic robust alphabet
+        all_atom_tokens = sf.get_semantic_robust_alphabet()
         
-        self.element_groups = cfg.get('element_groups', [])
+        # split all tokens
+        self.atom_tokens, self.bonded_atom_tokens, self.branch_tokens, self.ring_tokens = split_atoms(all_atom_tokens)
         
-        # Tokens for terminating molecule building or removing the last atom
+        # filter out valid atoms
+        self.atom_tokens = filter_valid_atoms(self.atom_tokens)
+        
+        # control tokens
         self.remove_token = "<REMOVE>"
         self.end_token = "<END>"
+
+                # 记录tokenizer的special tokens但不作为action
+        self.tokenizer_special_tokens = [
+                self.tokenizer.pad_token,
+                self.tokenizer.sos_token,
+                self.tokenizer.eos_token,
+                self.tokenizer.unk_token
+        ]
         
-        # Combine all possible actions into a single list
+        # combine all possible actions (不包含special tokens)
         self.actions_list = (self.atom_tokens + 
-                             self.bonded_atom_tokens +
-                             self.branch_tokens + 
-                             self.ring_tokens + 
-                             self.element_groups +
-                             [self.remove_token, self.end_token])
+                            self.bonded_atom_tokens +
+                            self.branch_tokens + 
+                            self.ring_tokens + 
+                            [self.remove_token, self.end_token])
         
+        vocab = self.tokenizer.get_vocab()
+        for action in self.actions_list:
+            if action not in vocab:
+                raise ValueError(f"Action {action} not in tokenizer vocabulary!")
+
+        # build the mapping between action and token id
+        action_token_ids = [self.tokenizer.token_to_id(tok) for tok in self.actions_list]
+        self.action_index2token_id = {
+            i: tid for i, tid in enumerate(action_token_ids)
+        }
+        self.token_id2action_index = {
+            tid: i for i, tid in enumerate(action_token_ids)
+        }
 
         self.max_len = cfg.get('max_len', 100)
-        
         
         
         self.episode_return = 0
@@ -316,17 +323,6 @@ class MassGymEnv(gym.Env):
         self.current_selfies = ""
         self.bond_counts = []
         self.smiles = ""
-
-
-        # initialize the tokenizer
-        self.tokenizer = selfies_tokenizer
-        action_token_ids = [ self.tokenizer.token_to_id(tok) for tok in self.actions_list ]
-        self.action_index2token_id = {
-            i: tid for i, tid in enumerate(action_token_ids)
-        }
-        self.token_id2action_index = {
-            tid: i for i, tid in enumerate(action_token_ids)
-        }
 
         self.bond_constraints = cfg.get('bond_constraints', get_bond_constraints())
         
@@ -357,7 +353,7 @@ class MassGymEnv(gym.Env):
             BaseEnvTimestep: Initial observation, reward, done flag, and info dictionary.
         """
         self.episode_length = 0
-        self.current_selfies = " "
+        self.current_selfies = ""
         self.bond_counts = []
         self.episode_return = 0
         self._final_eval_reward = 0.0
@@ -534,6 +530,11 @@ class MassGymEnv(gym.Env):
         if not self.current_selfies and self.remove_token in self.actions_list:
             idx = self.actions_list.index(self.remove_token)
             mask[idx] = False
+
+        # 永远屏蔽 pad/sos/eos/unk tokens
+        for special in self.tokenizer_special_tokens:
+            if special in self.actions_list:
+                mask[self.actions_list.index(special)] = False
 
         return mask
 

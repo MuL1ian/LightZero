@@ -66,6 +66,8 @@ class SelfiesTokenizer(SpecialTokensBaseTokenizer):
 
 
     def encode_selfies(self, selfies_str: str, add_special_tokens: bool = True) -> T.List[int]:
+        # print(selfies_str)
+        # print('===============================================')
         selfies_tokens = list(sf.split_selfies(selfies_str))
         return super().encode(
             selfies_tokens, is_pretokenized=True, add_special_tokens=add_special_tokens
@@ -98,6 +100,7 @@ if __name__ == "__main__":
     vocab = tokenizer.get_vocab()
     for token, id in sorted(vocab.items(), key=lambda x: x[1]):
         print(f"{token} -> {id}")
+    print(len(vocab))
 
 
 #special token ids

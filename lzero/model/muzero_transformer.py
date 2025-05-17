@@ -113,6 +113,7 @@ class MassSelfiesED(nn.Module):
 
         # split spectrum and prefix
         spectrum_embed = combined_embed[:, :self.spectrum_dim]  # (B, spectrum_dim)
+        # spectrum_embed = combined_embed
 
         tgt_tokens = tgt_tokens.long()
         spectrum_embed = spectrum_embed.to(self.device)
@@ -187,7 +188,7 @@ class MuZeroSelfiesTransformer(nn.Module):
                  dropout=0.1, device='cuda', **kwargs):
         super().__init__()
         # tokenizer and transformer
-        self.spectrum_dim = observation_shape
+        self.spectrum_dim = 4096
         self.tok = SelfiesTokenizer(max_len=max_len)
         vocab_size = len(self.tok.get_vocab())
         self.transformer = MassSelfiesED(vocab_size=vocab_size,
@@ -329,11 +330,11 @@ class MuZeroSelfiesTransformer(nn.Module):
 
         spectrum = next_latent_state[:, :self.spectrum_dim]
         ids = next_latent_state[:, self.spectrum_dim:]
-        mask = ids == self.tok.pad_token_id
+        mask = ids != self.tok.pad_token_id
 
-        # print("Spectrum shape: ", spectrum.shape)
-        # print("Ids shape: ", ids.shape)
-        # print("Mask shape: ", mask.shape)
+        print("Spectrum shape: ", spectrum.shape)
+        print("Ids shape: ", ids.shape)
+        print("Mask shape: ", mask.shape)
         # Get predictions from transformer
         logits, value = self.transformer(spectrum, ids, mask)
         

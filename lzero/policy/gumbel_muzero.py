@@ -355,6 +355,8 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         # The core difference between GumbelMuZero and MuZero
         # ==============================================================
         # In Gumbel MuZero, the policy loss is defined as the KL loss between current policy and improved policy calculated in MCTS.
+        print("policy_logits shape: ", policy_logits.shape)
+        print("improved_policy_batch[:, 0] shape: ", improved_policy_batch[:, 0].shape)
         policy_loss = self.kl_loss(torch.log(torch.softmax(policy_logits, dim=1)),
                                    torch.from_numpy(improved_policy_batch[:, 0]).to(self._cfg.device).detach().float())
         policy_loss = policy_loss.mean(dim=-1) * mask_batch[:, 0]

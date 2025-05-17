@@ -1,6 +1,8 @@
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from easydict import EasyDict
 import numpy as np
-import os
+# import os
 
 # ==============================================================
 # begin of the most frequently changed config specified by the user

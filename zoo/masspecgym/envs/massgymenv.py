@@ -33,7 +33,7 @@ from zoo.masspecgym.envs.mass_tokenizers import SelfiesTokenizer
 
 class DebugSpectrumDataset(Dataset):
     def __init__(self, file_path="../../policy_model/debug_spectrum_embeds.pt"):
-        self.data = torch.load(file_path)
+        self.data = torch.load(file_path, weights_only=False)
 
         list_lengths = []
         for key, value in self.data.items():

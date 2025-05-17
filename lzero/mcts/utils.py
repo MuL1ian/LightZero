@@ -102,6 +102,9 @@ def prepare_observation(observation_list, model_type='conv'):
         - np.ndarray: Reshaped array of observations.
     """
     assert model_type in ['conv', 'mlp', 'conv_context', 'mlp_context', 'transformer'], "model_type must be either 'conv' or 'mlp' or 'transformer'"
+    for obs in observation_list:
+        assert np.asarray(obs).shape[-1] == 4196, "The last dimension of the observation must be 4196, but got {}".format(np.asarray(obs).shape[-1])
+    # print("observation all good")
     observation_array = np.array(observation_list)
     batch_size = observation_array.shape[0]
 

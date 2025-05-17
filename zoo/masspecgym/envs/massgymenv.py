@@ -379,12 +379,12 @@ class MassGymEnv(gym.Env):
         
         spectrum = self.target_spectrum['embeds'] 
         token    = self.token_ids.float()  
+        
         combined_obs = torch.cat([spectrum, token], dim=-1)
 
         # print('===============')
         # print(combined_obs.shape)
         # print('===============')
-
         obs_dict = {
             'observation': combined_obs, # bacth * 4196 (4096 + 100) 4096 for spectrum, 100 for token ids
             'action_mask': action_mask,  
@@ -395,7 +395,8 @@ class MassGymEnv(gym.Env):
         
         if self.render_mode is not None:
             self.render(self.render_mode)
-        
+        # print(obs_dict)
+        assert obs_dict['observation'].shape[-1] == 4196, "The last dimension of the observation must be 4196, but got {}".format(combined_obs.shape[-1])
         return BaseEnvTimestep(obs_dict, to_ndarray([0.0], dtype=np.float32), False, {})
 
 
@@ -406,8 +407,22 @@ class MassGymEnv(gym.Env):
         Returns:
             Tensor: The token IDs of the SELFIES string.
         """
-        token_ids = self.tokenizer.encode_selfies(self.current_selfies)
-        return torch.tensor(token_ids, dtype=torch.long)
+        token_ids_list = self.tokenizer.encode_selfies(self.current_selfies)
+        # ---- DEBUG START ----
+        if not isinstance(token_ids_list, list) or len(token_ids_list) != self.max_len:
+            print(f"DEBUG: MassGymEnv._encode_selfies: tokenizer returned problematic token_ids_list!")
+            print(f"DEBUG: current_selfies = '{self.current_selfies}'")
+            print(f"DEBUG: type(token_ids_list) = {type(token_ids_list)}")
+            if isinstance(token_ids_list, list):
+                print(f"DEBUG: len(token_ids_list) = {len(token_ids_list)}, but max_len = {self.max_len}")
+                print(f"DEBUG: token_ids_list content (first 10): {token_ids_list[:10]}...")
+            else:
+                print(f"DEBUG: token_ids_list content: {token_ids_list}")
+            # Consider raising an error here or returning a dummy tensor for further debugging
+            # For example, to force a crash if this problematic case is hit:
+            # raise ValueError("Tokenizer returned malformed token_ids_list")
+        # ---- DEBUG END ----
+        return torch.tensor(token_ids_list, dtype=torch.long)
         
         
 
@@ -631,6 +646,7 @@ class MassGymEnv(gym.Env):
         token    = self.token_ids.float()  
         combined_obs = torch.cat([spectrum, token], dim=-1)
 
+
         obs_dict = {
             'observation': combined_obs,
             'action_mask': action_mask,
@@ -661,6 +677,7 @@ class MassGymEnv(gym.Env):
             self.render(self.render_mode)
         
         reward = to_ndarray([float(raw_reward)], dtype=np.float32)
+        assert obs_dict['observation'].shape[-1] == 4196, "The last dimension of the observation must be 4196, but got {}".format(obs_dict['observation'].shape[-1])
         
         return BaseEnvTimestep(obs_dict, reward, done, info)
 

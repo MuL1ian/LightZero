@@ -1091,7 +1091,8 @@ class GumbelMuZeroMCTSCtree(object):
                 # obtain the states for leaf nodes
                 for ix, iy in zip(latent_state_index_in_search_path, latent_state_index_in_batch):
                     latent_states.append(latent_state_batch_in_search_path[ix][iy])
-
+                # for s in latent_states:
+                #     print(np.asarray(s).shape)
                 latent_states = torch.from_numpy(np.asarray(latent_states)).to(device)
                 # .long() is only for discrete action
                 last_actions = torch.from_numpy(np.asarray(last_actions)).to(device).unsqueeze(1).long()

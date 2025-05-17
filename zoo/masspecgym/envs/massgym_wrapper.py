@@ -50,8 +50,10 @@ class MassGymLightZeroEnv(gym.Wrapper):
             'observation': observation,
             'action_mask': action_mask,
             'to_play': obs.get('to_play', -1),
-            'chance': obs.get('chance', 0.0)
+            'chance': obs.get('chance', 0.0),
+            'timestep': obs.get('timestep', 0)
         }
+        assert observation.shape[-1] == 4196, "The last dimension of the observation must be 4196, but got {}".format(observation.shape[-1])
         return lightzero_obs
 
     def step(self, action):
@@ -69,8 +71,10 @@ class MassGymLightZeroEnv(gym.Wrapper):
             'observation': observation,
             'action_mask': action_mask,
             'to_play': obs.get('to_play', -1),
-            'chance': obs.get('chance', 0.0)
+            'chance': obs.get('chance', 0.0),
+            'timestep': obs.get('timestep', 0)
         }
+        assert observation.shape[-1] == 4196, "The last dimension of the observation must be 4196, but got {}".format(observation.shape[-1])
 
         return BaseEnvTimestep(lightzero_obs, reward, done, info)
 

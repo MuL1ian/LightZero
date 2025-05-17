@@ -198,134 +198,149 @@ class MuZeroSelfiesTransformer(nn.Module):
         self.to(self.device)
         self.cached_spectrum = None
 
+    # def initial_inference(self, obs: torch.Tensor):
+    #     # ensure batch dim for obs
+    #     spec = obs if obs.dim()==2 else obs.unsqueeze(0)
+    #     self.cached_spectrum = spec.to(self.device)
+    #     B = spec.size(0)
+    #     # one-step prediction
+    #     pred = step_prediction(self.transformer, self.tok, spec, device=self.device)
+
+    #     # value: shape (B,1)
+    #     val = pred['value']
+    #     val = val.unsqueeze(-1) if val.dim()==1 else val
+    #     val = val.expand(B, 1)
+    #     # reward: (B,1)
+    #     # rew = torch.zeros_like(val)
+    #     rew = [0. for _ in range(val.shape[0])] 
+    #     # policy_logits: (B, action_dim)
+    #     pol = pred['logits'].unsqueeze(0).expand(B, -1)
+        
+    #     prefix = obs[:, self.spectrum_dim:]
+    #     # latent_state: prefix IDs should be (B,H)
+    #     next_token = torch.argmax(pol, dim=1, keepdim=True)
+    #     lat = prefix if prefix.dim()==2 else prefix.unsqueeze(0)
+    #     # new_prefix = torch.cat([lat, next_token], dim=1)
+        
+    #     # latent = new_prefix.unsqueeze(-1).unsqueeze(-1)
+
+    #     # return val, rew, pol, latent
+    #     return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=lat)
     def initial_inference(self, obs: torch.Tensor):
-        """
-        Overview:
-            Perform initial inference with fixed-size representation.
-        Arguments:
-            - obs (:obj:`torch.Tensor`): The observation tensor containing spectrum and initial prefix.
-        Returns:
-            - MZNetworkOutput containing value, reward, policy_logits, and latent_state.
-        """
-        # Ensure batch dimension
+        # print("Obs shape: ", obs.shape)
         vec = obs if obs.dim()==2 else obs.unsqueeze(0)
         self.cached_spectrum = vec.to(self.device)
+
         B = vec.size(0)
 
-        # Get initial predictions
+
         pred = step_prediction(self.transformer, self.tok, vec, device=self.device)
-        
-        # Process predictions
+
+        # print("================")
+        # print(pred['logits'].shape) # (B, vocab_size)
+        # print(pred['value'].shape) # (B)
+        # print(pred['probs'].shape) # (B, vocab_size)
+        # print("================")
         val = pred['value'].unsqueeze(-1).expand(B, 1)
+
+
         pol = pred['logits']
-        # rew = torch.zeros(B, 1, device=self.device)
+
+
         rew = [0.0] * B
 
-        # Get initial prefix and create fixed-size representation
-        prefix = vec[:, self.spectrum_dim:]
-        next_token = torch.argmax(pred['logits'], dim=1, keepdim=True)
-        new_prefix = torch.cat([prefix, next_token], dim=1)
-        
-        # Convert to fixed-size representation
-        latent_state, mask = self._representation(new_prefix)
+        # NOTE: latent_state is the current prefix, not the updated prefix
+        # NOTE: next_token is not decided yet, but to be decided by the MCTS
 
-        return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=latent_state)
+        # prefix = vec[:, self.spectrum_dim:]
+        # next_token = torch.argmax(pred['logits'], dim=1, keepdim=True)
 
-    def _representation(self, observation: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # new_prefix = torch.cat([prefix, next_token], dim=1)
+
+        # lat = new_prefix
+
+        # print("Latent state shape: ", obs.shape)
+
+        return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=obs)
+
+    def _representation(self, observation: torch.Tensor) -> torch.Tensor:
         """
         Overview:
-            Convert the observation into a fixed 2D representation with latent state and mask.
-            For molecule generation with SELFIES, we create a fixed-size representation with padding.
+            Simply return the prefix as the latent state representation.
+            For molecule generation with SELFIES, the state is just the current sequence of tokens.
         Arguments:
             - observation (:obj:`torch.Tensor`): The current prefix of SELFIES tokens.
         Returns:
-            - latent_state (:obj:`torch.Tensor`): Fixed-size tensor containing the prefix tokens.
-            - mask (:obj:`torch.Tensor`): Boolean mask indicating valid tokens.
+            - latent_state (:obj:`torch.Tensor`): The same prefix tensor.
         """
-        # Ensure observation has batch dimension
-        if observation.dim() == 1:
-            observation = observation.unsqueeze(0)
-        
-        # Get the prefix part (after spectrum)
-        prefix = observation[:, self.spectrum_dim:]
-        
-        # Create fixed-size representation
-        B, L = prefix.shape
-        max_len = self.tok.max_length
-        
-        # Pad the prefix to max_len
-        pad_len = max_len - L
-        if pad_len < 0:
-            raise ValueError(f"prefix length {L} exceeds max_len {max_len}")
-        
-        # Create padded latent state and mask
-        latent_state = torch.cat([
-            prefix,
-            torch.full((B, pad_len), self.tok.pad_token_id, device=prefix.device)
-        ], dim=1)
-        
-        mask = torch.cat([
-            torch.ones(B, L, dtype=torch.bool, device=prefix.device),
-            torch.zeros(B, pad_len, dtype=torch.bool, device=prefix.device)
-        ], dim=1)
-        
-        return latent_state, mask
+        return observation
 
-    def _dynamics(self, latent_state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _dynamics(self, latent_state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Overview:
-            Update the latent state by appending the new action token and adjusting the mask.
+            Concatenate the current prefix with the new token to get the next state.
+            For molecule generation with SELFIES, the dynamics is just appending the new token.
         Arguments:
-            - latent_state (:obj:`torch.Tensor`): Current fixed-size latent state.
+            - latent_state (:obj:`torch.Tensor`): The current prefix of SELFIES tokens.
             - action (:obj:`torch.Tensor`): The next token to append.
         Returns:
-            - next_latent_state (:obj:`torch.Tensor`): Updated fixed-size latent state.
-            - next_mask (:obj:`torch.Tensor`): Updated mask.
-            - reward (:obj:`torch.Tensor`): Zero reward tensor.
+            - next_latent_state (:obj:`torch.Tensor`): The concatenated prefix with new token.
+            - reward (:obj:`torch.Tensor`): Zero reward tensor since we don't use rewards in this setting.
         """
-        # Ensure action has the right shape and dtype for concatenation
-        action = action.unsqueeze(1) if action.dim() == 1 else action
-        action = action.to(dtype=latent_state.dtype)  # Match dtype with latent_state
+        # print("Latent state shape: ", latent_state.shape)
+        # action = action.unsqueeze(1) if action.dim() == 1 else action
+        action = action.squeeze().float()
+
+        # print("Action shape: ", action.shape)
+
+        # steps: find the padding token in latent_state, and replace the last padding token with the action
+        padding_mask = latent_state == self.tok.pad_token_id
+        last_padding_token_index = torch.sum(padding_mask, dim=1) - 1
+        latent_state[torch.arange(latent_state.size(0)), last_padding_token_index] = action
+
+        next_latent_state = latent_state
         
-        # Get current sequence length from mask
-        mask = (latent_state != self.tok.pad_token_id)
-        seq_len = mask.sum(dim=1, keepdim=True)
-        
-        # Create new mask with one more valid token
-        next_mask = mask.clone()
-        next_mask.scatter_(1, seq_len, True)
-        
-        # Update latent state by replacing the first padding token
-        next_latent_state = latent_state.clone()
-        next_latent_state.scatter_(1, seq_len, action)
-        
-        # Create zero reward tensor
+        # Create zero reward tensor with same batch size
         reward = torch.zeros(latent_state.size(0), 1, device=latent_state.device)
         
-        return next_latent_state, next_mask, reward
+        return next_latent_state, reward
 
     def recurrent_inference(self, latent_state: torch.Tensor, action: torch.Tensor):
         """
         Overview:
-            Perform recurrent inference using the fixed-size representation.
+            Perform recurrent inference using the simplified representation and dynamics.
         Arguments:
-            - latent_state (:obj:`torch.Tensor`): Current fixed-size latent state.
+            - latent_state (:obj:`torch.Tensor`): The current prefix of SELFIES tokens.
             - action (:obj:`torch.Tensor`): The next token to append.
         Returns:
             - value (:obj:`torch.Tensor`): Predicted value for the next state.
             - reward (:obj:`torch.Tensor`): Zero reward tensor.
             - policy_logits (:obj:`torch.Tensor`): Predicted policy logits for the next state.
-            - next_latent_state (:obj:`torch.Tensor`): Updated fixed-size latent state.
+            - next_latent_state (:obj:`torch.Tensor`): The concatenated prefix with new token.
         """
-        # Get next state, mask and reward using dynamics
-        next_latent_state, next_mask, reward = self._dynamics(latent_state, action)
+        # Get next state and reward using dynamics
+        next_latent_state, reward = self._dynamics(latent_state, action)
         
-        # Get predictions from transformer using the new state and mask
-        logits, value = self.transformer(self.cached_spectrum, next_latent_state, next_mask)
+        # Pad the new prefix for transformer input
+        # ids, mask = self._pad_batch_prefix(next_latent_state)
+
+        # specturm is the first 4096 dims, token is the last 100 dims
+        # mask is the tokens == pad_token_id
+
+        spectrum = next_latent_state[:, :self.spectrum_dim]
+        ids = next_latent_state[:, self.spectrum_dim:]
+        mask = ids == self.tok.pad_token_id
+
+        # print("Spectrum shape: ", spectrum.shape)
+        # print("Ids shape: ", ids.shape)
+        # print("Mask shape: ", mask.shape)
+        # Get predictions from transformer
+        logits, value = self.transformer(spectrum, ids, mask)
         
         # Reshape value to match expected format
         value = value.unsqueeze(-1)
 
+        # return value, reward, logits, next_latent_state
         return MZNetworkOutput(value=value, reward=reward, policy_logits=logits, latent_state=next_latent_state)
 
     def _pad_batch_prefix(self, prefix_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -7,9 +7,9 @@ import numpy as np
 # ==============================================================
 # begin of the most frequently changed config specified by the user
 # ==============================================================
-collector_env_num = 8
-n_episode = 3
-evaluator_env_num = 3
+collector_env_num = 10
+n_episode = 10
+evaluator_env_num = 10
 num_simulations = 20
 update_per_collect = 100
 batch_size = 20
@@ -39,7 +39,7 @@ massspecgym_gumbel_muzero_config = dict(
         reward_normalize=False,
         reward_norm_scale=1.0,
         reward_type='cosine_similarity',
-        max_len=120,
+        max_len=100,
         max_episode_steps=10,
         channel_last=True,
         need_flatten=False,

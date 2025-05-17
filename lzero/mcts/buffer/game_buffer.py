@@ -123,7 +123,6 @@ class GameBuffer(ABC, object):
         # +1e-6 for numerical stability
         probs = self.game_pos_priorities ** self._alpha + 1e-6
         probs /= probs.sum()
-
         # sample according to transition index
         batch_index_list = np.random.choice(num_of_transitions, batch_size, p=probs, replace=False)
 

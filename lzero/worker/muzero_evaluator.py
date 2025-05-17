@@ -247,6 +247,7 @@ class MuZeroEvaluator(ISerialEvaluator):
             timestep_dict = {}
             for i in range(env_nums):
                 if 'timestep' not in init_obs[i]:
+                    print(init_obs[i].keys())
                     print(f"Warning: 'timestep' key is missing in init_obs[{i}], assigning value -1")
                 timestep_dict[i] = to_ndarray(init_obs[i].get('timestep', -1))
             

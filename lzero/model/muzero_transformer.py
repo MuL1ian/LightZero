@@ -111,7 +111,7 @@ class MassSelfiesED(nn.Module):
         n_dec=6,
         n_head=8,
         dropout=0.1,
-        device="cpu",
+        device="cuda",
     ):
         super().__init__()
         self.device = torch.device(device)
@@ -238,7 +238,7 @@ def step_prediction(model: MassSelfiesED,
 class MuZeroSelfiesTransformer(nn.Module):
     def __init__(self, observation_shape=4096, max_len=128,
                  d_model=512, n_enc=4, n_dec=6, n_head=8,
-                 dropout=0.1, device='cpu', **kwargs):
+                 dropout=0.1, device='cuda', **kwargs):
         super().__init__()
         # tokenizer and transformer
         self.spectrum_dim = 4096
@@ -288,7 +288,7 @@ class MuZeroSelfiesTransformer(nn.Module):
         next_latent_state[torch.arange(next_latent_state.size(0)), last_padding_token_index] = action
 
         reward = torch.zeros(latent_state.size(0), 1, device=latent_state.device)
-        
+
         return next_latent_state, reward
 
     def recurrent_inference(self, latent_state: torch.Tensor, action: torch.Tensor):

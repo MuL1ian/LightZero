@@ -44,6 +44,8 @@ massspecgym_gumbel_muzero_config = dict(
         channel_last=True,
         need_flatten=False,
 
+        debug=True, #here control the dataset to use
+
         use_all_atom_tokens=True,
         use_bonded_atom_tokens=True,
         use_branch_tokens=True,  

@@ -32,7 +32,7 @@ from zoo.masspecgym.envs.mass_tokenizers import SelfiesTokenizer
 
 
 class DebugSpectrumDataset(Dataset):
-    def __init__(self, file_path="../../policy_model/debug_spectrum_embeds.pt"):
+    def __init__(self, file_path="../../DataLoader/debug_spectrum_embeds.pt"):
         self.data = torch.load(file_path, weights_only=False)
 
         list_lengths = []
@@ -221,6 +221,7 @@ class MassGymEnv(gym.Env):
         
         max_len=100,
         formula_masking=True,
+        debug=True,
     )
 
     @classmethod
@@ -233,6 +234,8 @@ class MassGymEnv(gym.Env):
         self._cfg = cfg
         self._init_flag = False
         self._env_id = cfg.get('env_id', 'mass_spec_env')
+
+        self.debug = cfg.get('debug', True)
         
         self.replay_format = cfg.get('replay_format', 'svg')
         self.replay_name_suffix = cfg.get('replay_name_suffix', 'eval')
@@ -326,7 +329,14 @@ class MassGymEnv(gym.Env):
 
         self.bond_constraints = cfg.get('bond_constraints', get_bond_constraints())
         
-        self.train_info = DebugSpectrumDataset()
+        if self.debug:
+            print("Using debug dataset")
+            print("================")
+            self.train_info = DebugSpectrumDataset(file_path="../../DataLoader/debug_spectrum_embeds.pt")
+        else:
+            print("Using train dataset")
+            print("================")
+            self.train_info = DebugSpectrumDataset(file_path="../../DataLoader/Trainning_spectrum_embeds.pt")
 
         self.reset()
         self._init_flag = True

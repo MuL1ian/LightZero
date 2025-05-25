@@ -212,7 +212,7 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             by import_names path. For MuZero, ``lzero.model.muzero_model.MuZeroModel``
         """
         if hasattr(self._cfg.model, 'use_transformer') and self._cfg.model.use_transformer:
-            return 'MuZeroSelfiesTransformer', ['lzero.model.muzero_transformer']
+            return 'MuZeroSelfiesTransformerEnhanced', ['lzero.model.muzero_transformer']
         elif self._cfg.model.model_type == "conv":
             return 'MuZeroModel', ['lzero.model.muzero_model']
         elif self._cfg.model.model_type == "mlp":
@@ -322,8 +322,8 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
 
         # transform a scalar to its categorical_distribution. After this transformation, each scalar is
         # represented as the linear combination of its two adjacent supports.
-        target_reward_categorical = phi_transform(self.reward_support, transformed_target_reward)
-        target_value_categorical = phi_transform(self.value_support, transformed_target_value)
+        # target_reward_categorical = phi_transform(self.reward_support, transformed_target_reward)
+        # target_value_categorical = phi_transform(self.value_support, transformed_target_value)
 
         # ==============================================================
         # the core initial_inference in Gumbel MuZero policy.
@@ -355,8 +355,8 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         # The core difference between GumbelMuZero and MuZero
         # ==============================================================
         # In Gumbel MuZero, the policy loss is defined as the KL loss between current policy and improved policy calculated in MCTS.
-        print("policy_logits shape: ", policy_logits.shape)
-        print("improved_policy_batch[:, 0] shape: ", improved_policy_batch[:, 0].shape)
+        # print("policy_logits shape: ", policy_logits.shape)
+        # print("improved_policy_batch[:, 0] shape: ", improved_policy_batch[:, 0].shape)
         policy_loss = self.kl_loss(torch.log(torch.softmax(policy_logits, dim=1)),
                                    torch.from_numpy(improved_policy_batch[:, 0]).to(self._cfg.device).detach().float())
         policy_loss = policy_loss.mean(dim=-1) * mask_batch[:, 0]
@@ -365,7 +365,8 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         prob = torch.softmax(policy_logits, dim=-1)
         policy_entropy = -(prob * prob.log()).sum(-1)
 
-        value_loss = cross_entropy_loss(value, target_value_categorical[:, 0])
+        # value_loss = cross_entropy_loss(value, target_value_categorical[:, 0])
+        value_loss = L1Loss(reduction='none')(value, target_value[:, 0]).mean(dim=-1) * mask_batch[:, 0]
 
         reward_loss = torch.zeros(self._cfg.batch_size, device=self._cfg.device)
         consistency_loss = torch.zeros(self._cfg.batch_size, device=self._cfg.device)
@@ -408,11 +409,16 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             # calculate policy loss for the next ``num_unroll_steps`` unroll steps.
             # NOTE: the +=.
             # ==============================================================
+            # print("debug: policy_logits: ", policy_logits)
+            # print("debug: improved_policy_batch[:, step_k + 1]: ", improved_policy_batch[:, step_k + 1])
             policy_loss += self.kl_loss(torch.log(torch.softmax(policy_logits, dim=1)),
                                         torch.from_numpy(improved_policy_batch[:, step_k + 1]).to(
                                             self._cfg.device).detach().float()).mean(dim=-1) * mask_batch[:, step_k + 1]
-            value_loss += cross_entropy_loss(value, target_value_categorical[:, step_k + 1])
-            reward_loss += cross_entropy_loss(reward, target_reward_categorical[:, step_k])
+            # value_loss += cross_entropy_loss(value, target_value_categorical[:, step_k + 1])
+            # reward_loss += cross_entropy_loss(reward, target_reward_categorical[:, step_k])
+            value_loss += L1Loss(reduction='none')(value, target_value[:, step_k + 1]).mean(dim=-1) * mask_batch[:, step_k + 1]
+            reward_loss += L1Loss(reduction='none')(reward, target_reward[:, step_k]).mean(dim=-1) * mask_batch[:, step_k]
+
 
             prob = torch.softmax(policy_logits, dim=-1)
             policy_entropy += (prob * prob.log()).sum(-1)
@@ -458,7 +464,10 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         if self._cfg.monitor_extra_statistics:
             predicted_rewards = torch.stack(predicted_rewards).transpose(1, 0).squeeze(-1)
             predicted_rewards = predicted_rewards.reshape(-1).unsqueeze(-1)
-
+        print("policy_loss: ", policy_loss.mean().item())
+        print("value: ", value.mean().item())
+        print("target_value: ", target_value.mean().item())
+        print("value_loss: ", value_loss.mean().item())
         return {
             'collect_mcts_temperature': self._collect_mcts_temperature,
             'cur_lr': self._optimizer.param_groups[0]['lr'],
@@ -693,6 +702,7 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
                 # action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
 
                 valid_value = np.where(action_mask[i] == 1.0, improved_policy_probs, 0.0)
+                # print("debug: valid_value: ", valid_value)
                 action = np.argmax([v for v in valid_value])
 
                 output[env_id] = {

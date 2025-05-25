@@ -28,7 +28,21 @@ import warnings
 import torch
 import random
 from torch.utils.data import Dataset
+from transformers import BertTokenizer
 from zoo.masspecgym.envs.mass_tokenizers import SelfiesTokenizer
+from zoo.masspecgym.envs.utils import (
+    parse_formula_counts,
+    extract_element_from_token,
+    get_allowed_elements_from_formula,
+    get_action_mask,
+    update_atom_counts,
+    validate_selfies_addition,
+    remove_last_token_from_selfies,
+    calculate_formula_completion_reward,
+    check_formula_match,
+    get_state_info
+)
+
 
 
 class DebugSpectrumDataset(Dataset):
@@ -221,6 +235,7 @@ class MassGymEnv(gym.Env):
         
         max_len=100,
         formula_masking=True,
+        formula_max_len=50,  # Maximum length for formula tokens
         debug=True,
     )
 
@@ -266,6 +281,10 @@ class MassGymEnv(gym.Env):
         
         # initialize the tokenizer
         self.tokenizer = selfies_tokenizer
+        self.formula_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        
+        # Formula tokenization parameters
+        self.formula_max_len = cfg.get('formula_max_len', 50)
         
         # get the semantic robust alphabet
         all_atom_tokens = sf.get_semantic_robust_alphabet()
@@ -293,7 +312,9 @@ class MassGymEnv(gym.Env):
                             self.bonded_atom_tokens +
                             self.branch_tokens + 
                             self.ring_tokens + 
-                            [self.remove_token, self.end_token])
+                            [self.end_token]
+                            # [self.remove_token, self.end_token]
+                            )
         
         vocab = self.tokenizer.get_vocab()
         for action in self.actions_list:
@@ -370,6 +391,11 @@ class MassGymEnv(gym.Env):
         self.should_done = False
         
         self.random_massspecgym_data()
+        
+        # Initialize atom tracking
+        self.target_element_counts = parse_formula_counts(self.target_spectrum.get('formulas', ''))
+        self.used_element_counts = {}
+        
         self.token_ids = self._encode_selfies()
         self._timestep = 0
 
@@ -384,15 +410,20 @@ class MassGymEnv(gym.Env):
         # combined_obs = torch.cat([spectrum_obs, token_obs], dim=1)
         
         spectrum = self.target_spectrum['embeds'] 
-        token    = self.token_ids.float()  
+        formula = self.target_spectrum['formulas']
         
-        combined_obs = torch.cat([spectrum, token], dim=-1)
+        # Encode formula using the helper method with fixed length
+        formula_token_ids = self._encode_formula(formula).float()
+        token = self.token_ids.float()  
+        
+        # Combine all observations: spectrum (4096) + selfies tokens (100) + formula tokens (50)
+        combined_obs = torch.cat([spectrum, token, formula_token_ids], dim=-1)
 
-        # print('===============')
-        # print(combined_obs.shape)
-        # print('===============')
+        # Calculate expected observation dimension
+        expected_dim = 4096 + self.max_len + self.formula_max_len  # 4096 + 100 + 50 = 4246
+        
         obs_dict = {
-            'observation': combined_obs, # bacth * 4196 (4096 + 100) 4096 for spectrum, 100 for token ids
+            'observation': combined_obs,
             'action_mask': action_mask,  
             'to_play': -1,
             'chance': self.chance,
@@ -401,8 +432,8 @@ class MassGymEnv(gym.Env):
         
         if self.render_mode is not None:
             self.render(self.render_mode)
-        # print(obs_dict)
-        assert obs_dict['observation'].shape[-1] == 4196, "The last dimension of the observation must be 4196, but got {}".format(combined_obs.shape[-1])
+            
+        assert obs_dict['observation'].shape[-1] == expected_dim, f"The last dimension of the observation must be {expected_dim}, but got {combined_obs.shape[-1]}"
         return BaseEnvTimestep(obs_dict, to_ndarray([0.0], dtype=np.float32), False, {})
 
 
@@ -431,122 +462,59 @@ class MassGymEnv(gym.Env):
         return torch.tensor(token_ids_list, dtype=torch.long)
         
         
+    def _encode_formula(self, formula):
+        """
+        Encode a chemical formula using BERT tokenizer with fixed length.
+        
+        Args:
+            formula (str): Chemical formula string.
+            
+        Returns:
+            torch.Tensor: Fixed-length tensor of formula token IDs.
+        """
+        # Encode the formula using BERT tokenizer
+        formula_token_ids = self.formula_tokenizer.encode(
+            formula,
+            add_special_tokens=True,  # Add [CLS] and [SEP] tokens
+            max_length=self.formula_max_len,
+            padding='max_length',  # Pad to max_length
+            truncation=True,  # Truncate if longer than max_length
+            return_tensors='pt'  # Return PyTorch tensors
+        )
+        
+        # Remove batch dimension and return as 1D tensor
+        return formula_token_ids.squeeze(0)
 
     def _get_allowed_elements_from_formula(self):
         """
         Extract allowed elements from a formula and return a set of all variants
         
-        Args:
-            formula (str): The formula string, e.g. "C6H12O6"
-                
         Returns:
             set: The set of allowed element symbols, including all variants (with charges and different bond types)
         """
-        formula = self.target_spectrum.get('formulas')
-
-
-        if formula is None:
-            return set()
-        
-        base_elements = set()
-        i = 0
-        
-        element_variants = {
-            'C': ['[C]', '[C+1]', '[C-1]', '[=C]', '[#C]', '[=C+1]', '[=C-1]', '[#C+1]', '[#C-1]'],
-            'N': ['[N]', '[N+1]', '[N-1]', '[=N]', '[#N]', '[=N+1]', '[=N-1]', '[#N+1]'],
-            'O': ['[O]', '[O+1]', '[O-1]', '[=O]', '[#O]', '[=O+1]', '[#O+1]'],
-            'S': ['[S]', '[S+1]', '[S-1]', '[=S]', '[#S]', '[=S+1]', '[#S+1]', '[=S-1]', '[#S-1]'],
-            'P': ['[P]', '[P+1]', '[P-1]', '[=P]', '[#P]', '[=P+1]', '[#P+1]', '[=P-1]', '[#P-1]'],
-            'B': ['[B]', '[B+1]', '[B-1]', '[=B]', '[#B]', '[=B+1]', '[=B-1]', '[#B-1]'],
-            'F': ['[F]'],
-            'I': ['[I]'],
-            'Cl': ['[Cl]'],
-            'Br': ['[Br]'],
-            'H': ['[H]']
-        }
-        
-        ring_variants = {
-            'Ring': ['[Ring1]', '[Ring2]', '[Ring3]']
-        }
-        
-        branch_variants = {
-            'Branch': ['[Branch1]', '[Branch2]', '[Branch3]']
-        }
-    
-        while i < len(formula):
-
-            if i + 1 < len(formula) and formula[i].isupper() and formula[i+1].islower():
-                symbol = formula[i:i+2]
-                i += 2
-            
-            elif formula[i].isupper():
-                symbol = formula[i]
-                i += 1
-            
-            elif formula[i].isdigit():
-                i += 1
-                continue
-            
-            else:
-                i += 1
-                continue
-            
-            base_elements.add(symbol)
-            
-            while i < len(formula) and formula[i].isdigit():
-                i += 1
-                
-        allowed_tokens = set()
-        for element in base_elements:
-            if element in element_variants:
-                allowed_tokens.update(element_variants[element])
-        
-        for variants in ring_variants.values():
-            allowed_tokens.update(variants)
-        for variants in branch_variants.values():
-            allowed_tokens.update(variants)
-        
-
-
-        return allowed_tokens
+        formula = self.target_spectrum.get('formulas', '')
+        return get_allowed_elements_from_formula(formula)
 
     def get_valid_actions(self): 
         """
         Generate a boolean mask over the full action space indicating which actions are valid.
         This does not change the size of the action space (always same as len(self.actions_list)).
         """
-        mask = np.ones(len(self.actions_list), dtype=np.bool_)
-
-        try:
-            # Only filter if formula_masking is enabled and formula exists
-            if self.formula_masking and hasattr(self, 'target_spectrum') and self.target_spectrum.get('formulas'):
-                formula = self.target_spectrum.get('formulas')
-                allowed_elements = self._get_allowed_elements_from_formula()
-                for i, action in enumerate(self.actions_list):
-                    if action in self.atom_tokens or action in self.bonded_atom_tokens:
-                        if action not in allowed_elements:
-                            mask[i] = False
-
-        except Exception as e:
-            print(f"[WARN] get_valid_actions formula filtering failed: {e}")
-            # fallback: allow all
-            mask[:] = True
-
-        # End token is always allowed
-        if self.end_token in self.actions_list:
-            idx = self.actions_list.index(self.end_token)
-            mask[idx] = True
-
-        if not self.current_selfies and self.remove_token in self.actions_list:
-            idx = self.actions_list.index(self.remove_token)
-            mask[idx] = False
-
-        # 永远屏蔽 pad/sos/eos/unk tokens
-        for special in self.tokenizer_special_tokens:
-            if special in self.actions_list:
-                mask[self.actions_list.index(special)] = False
-
-        return mask
+        formula = self.target_spectrum.get('formulas', '') if hasattr(self, 'target_spectrum') else ''
+        used_counts = getattr(self, 'used_element_counts', {})
+        
+        return get_action_mask(
+            formula=formula,
+            used_element_counts=used_counts,
+            actions_list=self.actions_list,
+            atom_tokens=self.atom_tokens,
+            bonded_atom_tokens=self.bonded_atom_tokens,
+            current_selfies=self.current_selfies,
+            formula_masking=self.formula_masking,
+            end_token=self.end_token,
+            remove_token=self.remove_token,
+            special_tokens=self.tokenizer_special_tokens
+        )
 
 
 
@@ -578,7 +546,11 @@ class MassGymEnv(gym.Env):
         self.episode_length += 1
         
         action_mask = self.get_valid_actions().astype(np.int8)
-        
+
+        # for i in range(len(action_mask)):
+        #     if action_mask[i]:
+        #         print("debug: available action: ", self.actions_list[i])
+
         # Execute the action
         action_name = self.actions_list[action]
         raw_reward = 0.0
@@ -586,8 +558,32 @@ class MassGymEnv(gym.Env):
         done = False
         self._timestep += 1
         
-        if action_name == self.remove_token and len(self.bond_counts) == 0:
-            raw_reward = -0.1
+        if action_name == self.remove_token:
+            if len(self.bond_counts) == 0:
+                raw_reward = -0.5  # Can't remove from empty molecule
+            else:
+                # Remove the last token and update atom tracking
+                if self.current_selfies:
+                    # Use utility function to remove last token
+                    updated_selfies, removed_token = remove_last_token_from_selfies(self.current_selfies)
+                    
+                    if removed_token:
+                        # Update atom counts using utility function
+                        self.used_element_counts = update_atom_counts(
+                            removed_token, self.used_element_counts, increment=False
+                        )
+                        
+                        self.current_selfies = updated_selfies
+                        
+                        # Update bond counts
+                        if self.bond_counts:
+                            self.bond_counts.pop()
+                        
+                        raw_reward = 0.0  # Neutral reward for successful removal
+                    else:
+                        raw_reward = -0.5
+                else:
+                    raw_reward = -0.5
         else:
             if action_name == self.end_token:
                 done = True
@@ -595,18 +591,20 @@ class MassGymEnv(gym.Env):
                 if self.current_selfies == sf.encoder(self.smiles):  #selfes to smiles
                     raw_reward = 1.0
                 else:
-                    raw_reward = 0.0
+                    raw_reward = -1.0
 
             # Handle atom addition
             elif action_name in self.actions_list:
-                new_selfies_candidate = self.current_selfies + action_name
-                valid_selfies = True
-                try:
-                    sf.split_selfies(new_selfies_candidate)
-                except:
-                    valid_selfies = False
+                valid_selfies = validate_selfies_addition(self.current_selfies, action_name)
                 
                 if valid_selfies:
+                    new_selfies_candidate = self.current_selfies + action_name
+                    
+                    # Track atom usage using utility function
+                    self.used_element_counts = update_atom_counts(
+                        action_name, self.used_element_counts, increment=True
+                    )
+                    
                     if not self.bond_counts:
                         self.current_selfies = new_selfies_candidate
                         self.bond_counts.append(0)
@@ -617,9 +615,9 @@ class MassGymEnv(gym.Env):
                         self.bond_counts.append(new_order)
                         self.current_selfies = new_selfies_candidate
                 else:
-                    raw_reward = -0.1
+                    raw_reward = -0.5
             else:
-                raw_reward = -0.1
+                raw_reward = -0.5
             
             #TODO adding reward here
 
@@ -648,15 +646,21 @@ class MassGymEnv(gym.Env):
                 done = True
         
 
-        # TODO 应该不是在这里batch，先取消这里的batch（目前）
-        # spectrum_obs = self.target_spectrum['embeds'].unsqueeze(0)  # [1, 4096]
-        # token_obs = self.token_ids.float().unsqueeze(0)  # [1, 100]
-
-        # combined_obs = torch.cat([spectrum_obs, token_obs], dim=1)
+        # Construct observation consistently with reset method
         spectrum = self.target_spectrum['embeds'] 
-        token    = self.token_ids.float()  
-        combined_obs = torch.cat([spectrum, token], dim=-1)
+        formula = self.target_spectrum['formulas']
+        
+        # Encode formula using the helper method with fixed length
+        formula_token_ids = self._encode_formula(formula).float()
+        token = self.token_ids.float()  
+        # print("debug: current selfies: ", self.current_selfies) 
+        # print("debug: target selfies: ", sf.encoder(self.smiles))
 
+        # Combine all observations: spectrum (4096) + selfies tokens (100) + formula tokens (50)
+        combined_obs = torch.cat([spectrum, token, formula_token_ids], dim=-1)
+
+        # Calculate expected observation dimension
+        expected_dim = 4096 + self.max_len + self.formula_max_len  # 4096 + 100 + 50 = 4246
 
         obs_dict = {
             'observation': combined_obs,
@@ -688,7 +692,7 @@ class MassGymEnv(gym.Env):
             self.render(self.render_mode)
         
         reward = to_ndarray([float(raw_reward)], dtype=np.float32)
-        assert obs_dict['observation'].shape[-1] == 4196, "The last dimension of the observation must be 4196, but got {}".format(obs_dict['observation'].shape[-1])
+        assert obs_dict['observation'].shape[-1] == expected_dim, f"The last dimension of the observation must be {expected_dim}, but got {combined_obs.shape[-1]}"
         
         return BaseEnvTimestep(obs_dict, reward, done, info)
 
@@ -966,5 +970,7 @@ class MassGymEnv(gym.Env):
     
     def __repr__(self) -> str:
         return "LightZero MassSpec Env."
+
+
 
     

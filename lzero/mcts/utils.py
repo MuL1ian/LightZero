@@ -78,7 +78,7 @@ def get_augmented_data(board_size, play_data):
     return extend_data
 
 
-def prepare_observation(observation_list, model_type='conv'):
+def prepare_observation(observation_list, model_type='conv', expected_obs_dim=None):
     """
     Prepare the observations to satisfy the input format of the model.
 
@@ -97,13 +97,18 @@ def prepare_observation(observation_list, model_type='conv'):
     Arguments:
         - observation_list (List): list of observations.
         - model_type (str): type of the model. (default is 'conv')
+        - expected_obs_dim (int, optional): expected observation dimension for validation.
 
     Returns:
         - np.ndarray: Reshaped array of observations.
     """
     assert model_type in ['conv', 'mlp', 'conv_context', 'mlp_context', 'transformer'], "model_type must be either 'conv' or 'mlp' or 'transformer'"
-    for obs in observation_list:
-        assert np.asarray(obs).shape[-1] == 4196, "The last dimension of the observation must be 4196, but got {}".format(np.asarray(obs).shape[-1])
+    
+    # Only validate observation dimension if expected_obs_dim is provided
+    if expected_obs_dim is not None:
+        for obs in observation_list:
+            obs_shape = np.asarray(obs).shape[-1]
+            assert obs_shape == expected_obs_dim, f"The last dimension of the observation must be {expected_obs_dim}, but got {obs_shape}"
     # print("observation all good")
     observation_array = np.array(observation_list)
     batch_size = observation_array.shape[0]

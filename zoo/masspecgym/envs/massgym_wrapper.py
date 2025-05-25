@@ -28,6 +28,9 @@ class MassGymLightZeroEnv(gym.Wrapper):
         
         self.action_size = len(env.actions_list)
         self.max_len = env.max_len
+        self.formula_max_len = env.formula_max_len
+        # Calculate expected observation dimension: spectrum + selfies tokens + formula tokens
+        self.expected_obs_dim = 4096 + self.max_len + self.formula_max_len
 
     # def _process_observation_for_mlp(self, observation):
     #     if isinstance(observation, np.ndarray):
@@ -36,7 +39,7 @@ class MassGymLightZeroEnv(gym.Wrapper):
     #         flattened = observation.cpu().numpy()
     #     return flattened
 
-    def _process_observation_for_mlp(self, observation): # Batch * 4196
+    def _process_observation_for_mlp(self, observation): # Batch * 4246 (4096 + 100 + 50)
         return observation
 
     def reset(self, *args, **kwargs):
@@ -53,7 +56,7 @@ class MassGymLightZeroEnv(gym.Wrapper):
             'chance': obs.get('chance', 0.0),
             'timestep': obs.get('timestep', 0)
         }
-        assert observation.shape[-1] == 4196, "The last dimension of the observation must be 4196, but got {}".format(observation.shape[-1])
+        assert observation.shape[-1] == self.expected_obs_dim, f"The last dimension of the observation must be {self.expected_obs_dim}, but got {observation.shape[-1]}"
         return lightzero_obs
 
     def step(self, action):
@@ -74,7 +77,7 @@ class MassGymLightZeroEnv(gym.Wrapper):
             'chance': obs.get('chance', 0.0),
             'timestep': obs.get('timestep', 0)
         }
-        assert observation.shape[-1] == 4196, "The last dimension of the observation must be 4196, but got {}".format(observation.shape[-1])
+        assert observation.shape[-1] == self.expected_obs_dim, f"The last dimension of the observation must be {self.expected_obs_dim}, but got {observation.shape[-1]}"
 
         return BaseEnvTimestep(lightzero_obs, reward, done, info)
 

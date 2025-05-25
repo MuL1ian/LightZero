@@ -68,7 +68,12 @@ class SelfiesTokenizer(SpecialTokensBaseTokenizer):
     def encode_selfies(self, selfies_str: str, add_special_tokens: bool = True) -> T.List[int]:
         # print(selfies_str)
         # print('===============================================')
-        selfies_tokens = list(sf.split_selfies(selfies_str))
+        try:
+            selfies_tokens = list(sf.split_selfies(selfies_str))
+        except Exception as e:
+            print(f"Error splitting SELFIES string: {e}")
+            print(f"Original SELFIES string: {selfies_str}")
+            raise e
         return super().encode(
             selfies_tokens, is_pretokenized=True, add_special_tokens=add_special_tokens
         ).ids

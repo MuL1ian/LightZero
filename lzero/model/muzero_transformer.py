@@ -6,34 +6,45 @@ from tokenizers import Tokenizer, processors, models
 from tokenizers.implementations import BaseTokenizer
 from typing import List, Tuple, Optional, Union
 from ding.utils import MODEL_REGISTRY, SequenceType
-from .common import MZNetworkOutput
+from lzero.model.common import MZNetworkOutput
 from zoo.masspecgym.envs.massgymenv import MassGymEnv
-
+from transformers import BertTokenizer
 # -----------------------------------------------------------------------------
 # Env for get the action list 
 # -----------------------------------------------------------------------------
-# cfg not used, just for init 
-cfg = {
-    'env_id': "mass_spec_env",
-    'render_mode': None,
-    'obs_type': 'fingerprint',
-    'reward_normalize': False,
-    'reward_norm_scale': 1.0,
-    'reward_type': 'cosine_similarity',
-    'target_spectrum': {
-        'embeds': torch.tensor([]), 
-        'formulas': ''  
-    },
-    'max_episode_steps': 100,
-    'is_collect': True,
-    'ignore_legal_actions': False,
-    'need_flatten': False,
-    'max_len': 100,
-    'formula_masking': True,
-}
+def get_actions_list():
+    """Get the actions list from the environment"""
+    try:
+        # cfg not used, just for init 
+        cfg = {
+            'env_id': "mass_spec_env",
+            'render_mode': None,
+            'obs_type': 'fingerprint',
+            'reward_normalize': False,
+            'reward_norm_scale': 1.0,
+            'reward_type': 'cosine_similarity',
+            'target_spectrum': {
+                'embeds': torch.tensor([]), 
+                'formulas': ''  
+            },
+            'max_episode_steps': 100,
+            'is_collect': True,
+            'ignore_legal_actions': False,
+            'need_flatten': False,
+            'max_len': 100,
+            'formula_masking': True,
+        }
 
-env = MassGymEnv(cfg)
-actions_list = env.actions_list  # length 71
+        env = MassGymEnv(cfg)
+        return env.actions_list  # length 71
+    except:
+        # Fallback actions list for testing
+        return ['[C]', '[H]', '[O]', '[N]', '[S]', '[P]', '[F]', '[Cl]', '[Br]', '[I]', 
+                '[=C]', '[=N]', '[=O]', '[=S]', '[#C]', '[#N]', '[Ring1]', '[Ring2]', '[Ring3]',
+                '[Branch1]', '[Branch2]', '[Branch3]', '<END>', '<REMOVE>'] + ['[UNK]'] * 47
+
+# Get actions list (lazy loading)
+actions_list = None
 
 # -----------------------------------------------------------------------------
 # Special-token constants
@@ -119,6 +130,9 @@ class MassSelfiesED(nn.Module):
         # tokenizer for special ids and pad
         self.tokenizer = SelfiesTokenizer(max_len=max_len)
         # compute action_token_ids from global actions_list
+        global actions_list
+        if actions_list is None:
+            actions_list = get_actions_list()
         self.action_token_ids = [self.tokenizer.token_to_id(tok) for tok in actions_list]
 
         # record special token ids
@@ -208,18 +222,10 @@ def step_prediction(model: MassSelfiesED,
     # extract prefix IDs from embedded vec
     prefix_ids = vec[:, model.spectrum_dim:].long()  # (B, prefix_len)
 
-    # rebuild token sequence
-    ids_list = [[tokenizer.sos_token_id] + row.tolist() for row in prefix_ids]
-    # pad and mask
-    max_len = tokenizer.max_length
-    ids_batch = []
-    mask_batch = []
-    for seq in ids_list:
-        ids_pad, m = pad_to_maxlen(seq, max_len, tokenizer.pad_token_id)
-        ids_batch.append(ids_pad)
-        mask_batch.append(m)
-    ids = torch.stack(ids_batch,  dim=0).to(dev)  # (B,T)
-    mask = torch.stack(mask_batch, dim=0).to(dev)  # (B,T)
+    # The prefix_ids already include SOS/EOS tokens and padding from the environment
+    # So we can use them directly without adding another SOS token
+    ids = prefix_ids.to(dev)  # (B, T)
+    mask = (ids != tokenizer.pad_token_id).to(dev)  # (B, T)
     # forward
     logits, value = model(vec, ids, mask)
     next_id = torch.argmax(logits, dim=-1)[0].item()
@@ -227,7 +233,7 @@ def step_prediction(model: MassSelfiesED,
         'logits': logits.squeeze(0),
         'value':  value, 
         'probs':  F.softmax(logits, dim=-1).squeeze(0).cpu().numpy(),
-        'current_prefix': ids_list[0],
+        'current_prefix': ids[0].tolist(),
         'next_token_id': next_id,
     }
 
@@ -236,7 +242,7 @@ def step_prediction(model: MassSelfiesED,
 # -----------------------------------------------------------------------------
 @MODEL_REGISTRY.register('MuZeroSelfiesTransformer')
 class MuZeroSelfiesTransformer(nn.Module):
-    def __init__(self, observation_shape=4096, max_len=128,
+    def __init__(self, observation_shape=4246, max_len=100,
                  d_model=512, n_enc=4, n_dec=6, n_head=8,
                  dropout=0.1, device='cuda', **kwargs):
         super().__init__()
@@ -263,7 +269,18 @@ class MuZeroSelfiesTransformer(nn.Module):
         self.cached_spectrum = vec.to(self.device)
         B = vec.size(0)
 
-        pred = step_prediction(self.transformer, self.tok, vec, device=self.device)
+        # For base class, extract only spectrum and SELFIES parts for transformer
+        # Assume observation is spectrum (4096) + SELFIES (max_len) + potentially other data
+        spectrum = vec[:, :self.spectrum_dim]
+        selfies_part = vec[:, self.spectrum_dim:self.spectrum_dim + self.tok.max_length]
+        
+        # Clamp SELFIES token IDs to valid vocabulary range to handle random data
+        vocab_size = len(self.tok.get_vocab())
+        selfies_part_clamped = torch.clamp(selfies_part.long(), 0, vocab_size - 1).float()
+        
+        combined_for_transformer = torch.cat([spectrum, selfies_part_clamped], dim=-1)
+        
+        pred = step_prediction(self.transformer, self.tok, combined_for_transformer, device=self.device)
         val = pred['value'].unsqueeze(-1).expand(B, 1)
         pol = pred['logits']
         rew = [0.0] * B
@@ -278,14 +295,23 @@ class MuZeroSelfiesTransformer(nn.Module):
         """Update latent state by replacing last padding token with action"""
         action = action.squeeze().float()
 
+        # Ensure latent_state has batch dimension
+        if latent_state.dim() == 1:
+            latent_state = latent_state.unsqueeze(0)
+        
         # clone for help gradient computation
         next_latent_state = latent_state.clone()
 
-        # print("latent_state shape: ", latent_state.shape)
-        padding_mask = next_latent_state == self.tok.pad_token_id
+        # Only look for padding tokens in the SELFIES part (after spectrum)
+        # For base class, extract only the SELFIES portion (max_len tokens after spectrum)
+        selfies_part = next_latent_state[:, self.spectrum_dim:self.spectrum_dim + self.tok.max_length]
+        padding_mask = selfies_part == self.tok.pad_token_id
         last_padding_token_index = torch.sum(padding_mask, dim=1) - 1
-
-        next_latent_state[torch.arange(next_latent_state.size(0)), last_padding_token_index] = action
+        
+        # Update the latent state at the correct global position
+        batch_indices = torch.arange(next_latent_state.size(0))
+        global_indices = self.spectrum_dim + last_padding_token_index
+        next_latent_state[batch_indices, global_indices] = action
 
         reward = torch.zeros(latent_state.size(0), 1, device=latent_state.device)
 
@@ -294,12 +320,22 @@ class MuZeroSelfiesTransformer(nn.Module):
     def recurrent_inference(self, latent_state: torch.Tensor, action: torch.Tensor):
         """Perform recurrent inference step"""
         next_latent_state, reward = self._dynamics(latent_state, action)
-        
-        spectrum = next_latent_state[:, :self.spectrum_dim]
-        ids = next_latent_state[:, self.spectrum_dim:]
-        mask = ids != self.tok.pad_token_id
+        # action is a tensor of shape (B, 1)
+        # check if any of the actions is the end token
+        if (action == self.tok.end_token_id).any():
+            print("end token found in recurrent inference")
 
-        logits, value = self.transformer(spectrum, ids, mask)
+        # For base class, extract only spectrum and SELFIES parts for transformer
+        spectrum = next_latent_state[:, :self.spectrum_dim]
+        selfies_part = next_latent_state[:, self.spectrum_dim:self.spectrum_dim + self.tok.max_length]
+        
+        # Clamp SELFIES token IDs to valid vocabulary range
+        vocab_size = len(self.tok.get_vocab())
+        selfies_part_clamped = torch.clamp(selfies_part.long(), 0, vocab_size - 1)
+        
+        mask = (selfies_part_clamped != self.tok.pad_token_id) & (selfies_part_clamped != self.tok.end_token_id)
+
+        logits, value = self.transformer(spectrum, selfies_part_clamped, mask)
         value = value.unsqueeze(-1)
 
         return MZNetworkOutput(value=value, reward=reward, policy_logits=logits, latent_state=next_latent_state)
@@ -315,9 +351,326 @@ class MuZeroSelfiesTransformer(nn.Module):
                          torch.zeros(B, pad_len, dtype=torch.bool, device=prefix_ids.device)], dim=1)
         return inp, msk
 
+# -----------------------------------------------------------------------------
+# Enhanced MuZero transformer with formula masking and proper end detection
+# -----------------------------------------------------------------------------
+@MODEL_REGISTRY.register('MuZeroSelfiesTransformerEnhanced')
+class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
+    def __init__(self, observation_shape=4246, max_len=100,
+                 d_model=512, n_enc=4, n_dec=6, n_head=8,
+                 dropout=0.1, device='cuda', target_formula=None,  # Deprecated: formula extracted from observations
+                 formula_max_len=50, **kwargs):
+        super().__init__(observation_shape, max_len, d_model, n_enc, n_dec, 
+                        n_head, dropout, device, **kwargs)
+        
+        # Note: target_formula is now extracted dynamically from observations
+        
+        # Update dimensions for new observation structure
+        # Observation: spectrum (4096) + selfies tokens (max_len) + formula tokens (formula_max_len)
+        self.formula_max_len = formula_max_len
+        self.selfies_start_idx = self.spectrum_dim  # 4096
+        self.formula_start_idx = self.spectrum_dim + max_len  # 4096 + max_len
+        # print("debug: max_len: ", max_len)
+        # print("debug: formula_max_len: ", formula_max_len)
+        # print("debug: observation_shape: ", observation_shape)
+        assert self.formula_start_idx + self.formula_max_len == observation_shape, \
+            f"formula_start_idx + formula_max_len != observation_shape, {self.formula_start_idx} + {self.formula_max_len} != {observation_shape}"
+        
+        self.bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        # Import the utility functions for action masking
+        try:
+            import sys
+            import os
+            # Try absolute import first
+            from zoo.masspecgym.envs.utils import get_action_mask_from_selfies_string
+            self.get_action_mask_from_selfies_string = get_action_mask_from_selfies_string
+        except ImportError:
+            try:
+                # Try relative path import
+                utils_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../zoo/masspecgym/envs'))
+                if utils_path not in sys.path:
+                    sys.path.insert(0, utils_path)
+                import utils as massgym_utils
+                self.get_action_mask_from_selfies_string = massgym_utils.get_action_mask_from_selfies_string
+            except ImportError as e:
+                print(f"[WARN] Could not import action masking utilities: {e}")
+                # Fallback: disable formula masking
+                self.get_action_mask_from_selfies_string = None
+        
+        # Get action lists from environment for masking
+        global actions_list
+        if actions_list is None:
+            actions_list = get_actions_list()
+        self.atom_tokens = [token for token in actions_list if token.startswith('[') and 
+                           not any(special in token for special in ['Ring', 'Branch'])]
+        self.bonded_atom_tokens = []  # Can be extended if needed
+        
+    def set_target_formula(self, formula: str):
+        """Deprecated: target formula is now extracted dynamically from observations"""
+        print(f"[WARN] set_target_formula is deprecated. Formula is now extracted from observations automatically.")
+        
+    def _dynamics(self, latent_state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Update latent state by replacing last padding token with action in SELFIES part only"""
+        action = action.squeeze().float()
+
+        # Ensure latent_state has batch dimension
+        if latent_state.dim() == 1:
+            latent_state = latent_state.unsqueeze(0)
+        
+        # Clone for gradient computation
+        next_latent_state = latent_state.clone()
+
+        # Extract SELFIES part only for modification
+        selfies_part = next_latent_state[:, self.selfies_start_idx:self.formula_start_idx]
+        
+        # Find padding tokens only in SELFIES part
+        padding_mask = selfies_part == self.tok.pad_token_id
+        last_padding_token_index = torch.sum(padding_mask, dim=1) - 1
+        
+        # Update only the SELFIES part
+        batch_indices = torch.arange(next_latent_state.size(0))
+        global_indices = self.selfies_start_idx + last_padding_token_index
+        next_latent_state[batch_indices, global_indices] = action
+
+        reward = torch.zeros(latent_state.size(0), 1, device=latent_state.device)
+
+        return next_latent_state, reward
+
+    def _extract_selfies_from_latent_state(self, latent_state: torch.Tensor) -> List[str]:
+        """Extract SELFIES strings from latent state tensor"""
+        # Ensure latent_state has batch dimension
+        if latent_state.dim() == 1:
+            latent_state = latent_state.unsqueeze(0)
+            
+        # Extract SELFIES token IDs (excluding spectrum and formula parts)
+        selfies_ids = latent_state[:, self.selfies_start_idx:self.formula_start_idx].long()
+        
+        selfies_strings = []
+        for batch_idx in range(selfies_ids.size(0)):
+            # Get non-padding tokens
+            token_ids = selfies_ids[batch_idx]
+            valid_mask = (token_ids != self.tok.pad_token_id) & (token_ids != self.tok.sos_token_id)
+            valid_ids = token_ids[valid_mask].tolist()
+            
+            # Convert token IDs back to SELFIES string
+            try:
+                selfies_str = self.tok.decode_to_selfies(valid_ids, skip_special_tokens=True)
+                selfies_strings.append(selfies_str)
+            except:
+                selfies_strings.append("")
+                
+        return selfies_strings
+    
+    def _extract_formula_from_latent_state(self, latent_state: torch.Tensor) -> List[str]:
+        """Extract formula strings from latent state tensor"""
+        # Ensure latent_state has batch dimension
+        if latent_state.dim() == 1:
+            latent_state = latent_state.unsqueeze(0)
+            
+        # Extract formula token IDs
+        # print(f"debug: spectrum_dim: {self.spectrum_dim}, max_len: {self.max_len}, formula_max_len: {self.formula_max_len}")
+        # print('debug: formula_start_idx: ', self.formula_start_idx)
+        # print("debug: latent_state shape: ", latent_state.shape)
+        formula_ids = latent_state[:, self.formula_start_idx:].long()
+        # print("debug: formula_ids shape: ", formula_ids.shape)
+        
+        # Import BERT tokenizer for decoding
+        formula_strings = []
+        for batch_idx in range(formula_ids.size(0)):
+            token_ids = formula_ids[batch_idx].tolist()
+            # Decode formula tokens
+            # try:
+            formula_str = self.bert_tokenizer.decode(token_ids, skip_special_tokens=True)
+            formula_strings.append(formula_str.strip())
+            # except:
+            #     formula_strings.append("")
+                
+        return formula_strings
+    
+    def _apply_formula_mask(self, logits: torch.Tensor, current_selfies_list: List[str], formula_list: List[str]) -> torch.Tensor:
+        """Apply formula-based action masking to logits"""
+        # Check for NaN in input logits first
+        if torch.isnan(logits).any():
+            print(f"[WARN] NaN detected in input logits before masking")
+            logits = torch.where(torch.isnan(logits), torch.tensor(0.0, device=logits.device), logits)
+        
+        if not formula_list or not any(formula_list):
+            return logits
+            
+        masked_logits = logits.clone()
+        batch_size = logits.size(0)
+        
+        for batch_idx in range(batch_size):
+            current_selfies = current_selfies_list[batch_idx]
+            target_formula = formula_list[batch_idx] if batch_idx < len(formula_list) else ""
+            
+            if not target_formula:
+                continue
+                
+            try:
+                # Get action mask using the utility function
+                action_mask = self.get_action_mask_from_selfies_string(
+                    formula=target_formula,
+                    current_selfies=current_selfies,
+                    actions_list=actions_list,
+                    atom_tokens=self.atom_tokens,
+                    bonded_atom_tokens=self.bonded_atom_tokens,
+                    formula_masking=True,
+                    end_token="<END>",
+                    remove_token="<REMOVE>",
+                    special_tokens=[]
+                )
+                mask_tensor = torch.tensor(action_mask, dtype=torch.bool, device=logits.device)
+                
+                # Use a safer masking approach
+                # Find the minimum logit value and subtract a reasonable amount
+                min_logit = masked_logits[batch_idx].min().item()
+                mask_value = min_logit - 10.0  # Subtract 10 from minimum to ensure masked actions have very low probability
+                
+                masked_logits[batch_idx][~mask_tensor] = mask_value
+                
+            except Exception as e:
+                print(f"[WARN] Failed to apply formula mask for batch {batch_idx}: {e}")
+                # Continue without masking for this batch
+                
+        # Final check for NaN values
+        if torch.isnan(masked_logits).any():
+            print(f"[WARN] NaN detected in final masked_logits, replacing with safe values")
+            masked_logits = torch.where(torch.isnan(masked_logits), torch.tensor(-10.0, device=logits.device), masked_logits)
+                
+        return masked_logits
+    
+    def _check_completion_status(self, current_selfies_list: List[str], formula_list: List[str]) -> List[bool]:
+        """Check if molecules are complete based on available actions"""
+        if not formula_list or not any(formula_list):
+            return [False] * len(current_selfies_list)
+            
+        completion_status = []
+        
+        for idx, current_selfies in enumerate(current_selfies_list):
+            target_formula = formula_list[idx] if idx < len(formula_list) else ""
+            
+            if not target_formula:
+                completion_status.append(False)
+                continue
+                
+            try:
+                # Get action mask
+                action_mask = self.get_action_mask_from_selfies_string(
+                    formula=target_formula,
+                    current_selfies=current_selfies,
+                    actions_list=actions_list,
+                    atom_tokens=self.atom_tokens,
+                    bonded_atom_tokens=self.bonded_atom_tokens,
+                    formula_masking=True,
+                    end_token="<END>",
+                    remove_token="<REMOVE>",
+                    special_tokens=[]
+                )
+                
+                # Check if only END token is available
+                end_token_idx = actions_list.index("<END>") if "<END>" in actions_list else -1
+                
+                if end_token_idx >= 0:
+                    # Count available actions (excluding END token)
+                    available_non_end_actions = sum(action_mask) - (1 if action_mask[end_token_idx] else 0)
+                    is_complete = available_non_end_actions == 0 and action_mask[end_token_idx]
+                else:
+                    # If no END token, check if no actions are available
+                    is_complete = sum(action_mask) == 0
+                    
+                completion_status.append(is_complete)
+                
+            except Exception as e:
+                print(f"[WARN] Failed to check completion status: {e}")
+                completion_status.append(False)
+                
+        return completion_status
+    
+    def recurrent_inference(self, latent_state: torch.Tensor, action: torch.Tensor):
+        """Enhanced recurrent inference with formula masking and proper end detection"""
+        next_latent_state, reward = self._dynamics(latent_state, action)
+        
+        # Extract current SELFIES strings from latent state
+        current_selfies_list = self._extract_selfies_from_latent_state(next_latent_state)
+        
+        # Extract formula strings for debugging/logging
+        formula_list = self._extract_formula_from_latent_state(next_latent_state)
+        
+        # Check completion status
+        completion_status = self._check_completion_status(current_selfies_list, formula_list)
+        
+        # Print completion info if any molecule is complete
+        if any(completion_status):
+            complete_indices = [i for i, complete in enumerate(completion_status) if complete]
+            print(f"Molecules complete at indices {complete_indices}")
+            for idx in complete_indices:
+                print(f"  Batch {idx}: SELFIES='{current_selfies_list[idx]}', Formula='{formula_list[idx]}'")
+        
+        # Get transformer output - only use spectrum and SELFIES parts for transformer
+        spectrum = next_latent_state[:, :self.spectrum_dim]
+        selfies_ids = next_latent_state[:, self.selfies_start_idx:self.formula_start_idx]
+        
+        # Clamp SELFIES token IDs to valid vocabulary range
+        vocab_size = len(self.tok.get_vocab())
+        selfies_ids_clamped = torch.clamp(selfies_ids.long(), 0, vocab_size - 1)
+        
+        mask = (selfies_ids_clamped != self.tok.pad_token_id) & (selfies_ids_clamped != self.tok.end_token_id)
+
+        logits, value = self.transformer(spectrum, selfies_ids_clamped, mask)
+        
+        # Apply formula-based action masking
+        masked_logits = self._apply_formula_mask(logits, current_selfies_list, formula_list)
+        value = value.unsqueeze(-1)
+
+        return MZNetworkOutput(
+            value=value, 
+            reward=reward, 
+            policy_logits=masked_logits, 
+            latent_state=next_latent_state
+        )
+    
+    def initial_inference(self, obs: torch.Tensor):
+        """Enhanced initial inference with formula masking"""
+        vec = obs if obs.dim()==2 else obs.unsqueeze(0)
+        self.cached_spectrum = vec.to(self.device)
+        B = vec.size(0)
+
+        # Extract formula from observation
+        formula_list = self._extract_formula_from_latent_state(vec)
+        # if formula_list and formula_list[0]:
+        #     print(f"Using target formula from observation: '{formula_list[0]}'")
+
+        # Get initial prediction - only use spectrum and SELFIES parts
+        spectrum = vec[:, :self.spectrum_dim]
+        selfies_part = vec[:, self.selfies_start_idx:self.formula_start_idx]
+        
+        # Clamp SELFIES token IDs to valid vocabulary range to handle random data
+        vocab_size = len(self.tok.get_vocab())
+        selfies_part_clamped = torch.clamp(selfies_part.long(), 0, vocab_size - 1)
+        
+        # Create mask for transformer
+        mask = (selfies_part_clamped != self.tok.pad_token_id) & (selfies_part_clamped != self.tok.end_token_id)
+        
+        # Use transformer directly for batch processing
+        logits, value = self.transformer(spectrum, selfies_part_clamped, mask)
+        
+        # Extract initial SELFIES (should be empty)
+        current_selfies_list = self._extract_selfies_from_latent_state(vec)
+        
+        # Apply formula masking to logits
+        masked_logits = self._apply_formula_mask(logits, current_selfies_list, formula_list)
+        
+        val = value.unsqueeze(-1)
+        pol = masked_logits
+        rew = [0.0] * B
+
+        return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=obs)
+
+
 if __name__ == "__main__":
     # quick sanity check
-    data   = torch.randn(4196)
+    data   = torch.randn(4246)  # Updated to new observation dimension
     model  = MuZeroSelfiesTransformer()
     out = model.initial_inference(data)
     print([t.shape for t in (out.value, out.reward, out.policy_logits, out.latent_state)])

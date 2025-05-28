@@ -1,14 +1,21 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import selfies as sf
-from tokenizers import Tokenizer, processors, models
-from tokenizers.implementations import BaseTokenizer
 from typing import List, Tuple, Optional, Union
 from ding.utils import MODEL_REGISTRY, SequenceType
 from lzero.model.common import MZNetworkOutput
+from lzero.model.selfies_tokenizer import SelfiesTokenizer, pad_to_maxlen
 from zoo.masspecgym.envs.massgymenv import MassGymEnv
-from transformers import BertTokenizer
+import re
+
+# Import global reward network
+try:
+    from lzero.model import global_reward_network
+    GLOBAL_REWARD_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] Global reward network not available in transformer: {e}")
+    GLOBAL_REWARD_AVAILABLE = False
+    global_reward_network = None
 # -----------------------------------------------------------------------------
 # Env for get the action list 
 # -----------------------------------------------------------------------------
@@ -38,76 +45,183 @@ def get_actions_list():
         env = MassGymEnv(cfg)
         return env.actions_list  # length 71
     except:
-        # Fallback actions list for testing
-        return ['[C]', '[H]', '[O]', '[N]', '[S]', '[P]', '[F]', '[Cl]', '[Br]', '[I]', 
+        # Fallback actions list for testing (excluding [H] since hydrogens are implicit in SELFIES)
+        return ['[C]', '[O]', '[N]', '[S]', '[P]', '[F]', '[Cl]', '[Br]', '[I]', 
                 '[=C]', '[=N]', '[=O]', '[=S]', '[#C]', '[#N]', '[Ring1]', '[Ring2]', '[Ring3]',
                 '[Branch1]', '[Branch2]', '[Branch3]', '<END>', '<REMOVE>'] + ['[UNK]'] * 47
 
 # Get actions list (lazy loading)
 actions_list = None
 
-# -----------------------------------------------------------------------------
-# Special-token constants
-# -----------------------------------------------------------------------------
-PAD_TOKEN = "<pad>"
-SOS_TOKEN = "<s>"
-EOS_TOKEN = "</s>"
-UNK_TOKEN = "<unk>"
-
-class SpecialTokensBaseTokenizer(BaseTokenizer):
-    def __init__(self, tokenizer: Tokenizer, max_len: int):
-        super().__init__(tokenizer)
-        self.pad_token = PAD_TOKEN
-        self.sos_token = SOS_TOKEN
-        self.eos_token = EOS_TOKEN
-        self.unk_token = UNK_TOKEN
-        self.max_length = max_len
-        # Ensure REMOVE and END are in vocab
-        self._tokenizer.add_tokens(["<REMOVE>", "<END>"])
+# Custom Chemical Formula Tokenizer
+class ChemicalFormulaTokenizer:
+    """
+    A case-sensitive tokenizer specifically designed for chemical formulas.
+    Preserves capitalization which is crucial for chemical elements.
+    """
+    def __init__(self, max_length=50):
+        self.max_length = max_length
+        
+        # Common chemical elements (case-sensitive)
+        self.elements = [
+            'H', 'He', 'Li', 'Be', 'B', 'C', 'N', 'O', 'F', 'Ne',
+            'Na', 'Mg', 'Al', 'Si', 'P', 'S', 'Cl', 'Ar', 'K', 'Ca',
+            'Sc', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn',
+            'Ga', 'Ge', 'As', 'Se', 'Br', 'Kr', 'Rb', 'Sr', 'Y', 'Zr',
+            'Nb', 'Mo', 'Tc', 'Ru', 'Rh', 'Pd', 'Ag', 'Cd', 'In', 'Sn',
+            'Sb', 'Te', 'I', 'Xe', 'Cs', 'Ba', 'La', 'Ce', 'Pr', 'Nd',
+            'Pm', 'Sm', 'Eu', 'Gd', 'Tb', 'Dy', 'Ho', 'Er', 'Tm', 'Yb',
+            'Lu', 'Hf', 'Ta', 'W', 'Re', 'Os', 'Ir', 'Pt', 'Au', 'Hg',
+            'Tl', 'Pb', 'Bi', 'Po', 'At', 'Rn'
+        ]
+        
+        # Special tokens
+        self.pad_token = '[PAD]'
+        self.unk_token = '[UNK]'
+        self.cls_token = '[CLS]'
+        self.sep_token = '[SEP]'
+        
+        # Build vocabulary: special tokens + elements + digits
+        self.vocab = {
+            self.pad_token: 0,
+            self.unk_token: 1,
+            self.cls_token: 2,
+            self.sep_token: 3,
+        }
+        
+        # Add elements to vocabulary
+        for i, element in enumerate(self.elements):
+            self.vocab[element] = i + 4
+            
+        # Add digits 0-9
+        for digit in '0123456789':
+            self.vocab[digit] = len(self.vocab)
+            
+        # Create reverse mapping
+        self.id_to_token = {v: k for k, v in self.vocab.items()}
+        
+        self.pad_token_id = self.vocab[self.pad_token]
+        self.unk_token_id = self.vocab[self.unk_token]
+        self.cls_token_id = self.vocab[self.cls_token]
+        self.sep_token_id = self.vocab[self.sep_token]
+    
+    def tokenize_formula(self, formula: str) -> List[str]:
+        """
+        Tokenize a chemical formula into elements and numbers.
+        
+        Args:
+            formula (str): Chemical formula like "C6H12O6"
+            
+        Returns:
+            List[str]: List of tokens preserving case
+        """
+        if not formula:
+            return []
+            
+        tokens = []
+        i = 0
+        
+        while i < len(formula):
+            # Try to match two-letter element (e.g., Cl, Br, Ca)
+            if i + 1 < len(formula) and formula[i:i+2] in self.elements:
+                tokens.append(formula[i:i+2])
+                i += 2
+            # Try to match single-letter element (e.g., C, H, O)
+            elif formula[i] in self.elements:
+                tokens.append(formula[i])
+                i += 1
+            # Match digits
+            elif formula[i].isdigit():
+                # Collect consecutive digits
+                num_start = i
+                while i < len(formula) and formula[i].isdigit():
+                    i += 1
+                # Add each digit separately for better tokenization
+                for digit in formula[num_start:i]:
+                    tokens.append(digit)
+            else:
+                # Skip unknown characters
+                i += 1
+                
+        return tokens
+    
+    def encode(self, formula: str, add_special_tokens=True, max_length=None, 
+               padding='max_length', truncation=True, return_tensors=None):
+        """
+        Encode a chemical formula to token IDs.
+        
+        Args:
+            formula (str): Chemical formula
+            add_special_tokens (bool): Whether to add [CLS] and [SEP]
+            max_length (int): Maximum sequence length
+            padding (str): Padding strategy
+            truncation (bool): Whether to truncate
+            return_tensors (str): Return format
+            
+        Returns:
+            torch.Tensor or List[int]: Token IDs
+        """
+        if max_length is None:
+            max_length = self.max_length
+            
+        # Tokenize the formula
+        tokens = self.tokenize_formula(formula)
+        
         # Add special tokens
-        self.add_special_tokens([self.pad_token, self.sos_token, self.eos_token, self.unk_token])
-        # Record token IDs
-        self.pad_token_id = self.token_to_id(self.pad_token)
-        self.sos_token_id = self.token_to_id(self.sos_token)
-        self.eos_token_id = self.token_to_id(self.eos_token)
-        self.unk_token_id = self.token_to_id(self.unk_token)
-        self.remove_token_id = self.token_to_id("<REMOVE>")
-        self.end_token_id    = self.token_to_id("<END>")
-        # Enable padding and truncation
-        self.enable_padding(direction="right", pad_token=self.pad_token, pad_id=self.pad_token_id, length=max_len)
-        self.enable_truncation(max_len)
-        # Post processor for adding SOS/EOS
-        self._tokenizer.post_processor = processors.TemplateProcessing(
-            single=f"{self.sos_token} $A {self.eos_token}",
-            pair=f"{self.sos_token} $A {self.eos_token} {self.sos_token} $B {self.eos_token}",
-            special_tokens=[(self.sos_token, self.sos_token_id), (self.eos_token, self.eos_token_id)],
-        )
-
-class SelfiesTokenizer(SpecialTokensBaseTokenizer):
-    def __init__(self, max_len: int):
-        alphabet = list(sorted(sf.get_semantic_robust_alphabet()))
-        vocab = {symbol: i for i, symbol in enumerate(alphabet)}
-        vocab[UNK_TOKEN] = len(vocab)
-        tokenizer = Tokenizer(models.WordLevel(vocab=vocab, unk_token=UNK_TOKEN))
-        super().__init__(tokenizer, max_len)
-
-    def encode_selfies(self, selfies_str: str, add_special_tokens: bool = True) -> List[int]:
-        tokens = list(sf.split_selfies(selfies_str))
-        return super().encode(tokens, is_pretokenized=True, add_special_tokens=add_special_tokens).ids
-
-    def decode_to_selfies(self, token_ids: List[int], skip_special_tokens: bool = True) -> str:
-        text = super().decode(token_ids, skip_special_tokens=skip_special_tokens)
-        return text.replace(" ", "")
-
-# -----------------------------------------------------------------------------
-# Utility: pad sequence to max_len
-# -----------------------------------------------------------------------------
-def pad_to_maxlen(ids: List[int], max_len: int, pad_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    if len(ids) > max_len:
-        raise ValueError(f"Sequence too long: {len(ids)} > {max_len}")
-    padded = ids + [pad_id] * (max_len - len(ids))
-    mask   = [1] * len(ids) + [0] * (max_len - len(ids))
-    return torch.tensor(padded, dtype=torch.long), torch.tensor(mask, dtype=torch.bool)
+        if add_special_tokens:
+            tokens = [self.cls_token] + tokens + [self.sep_token]
+        
+        # Convert to IDs
+        token_ids = []
+        for token in tokens:
+            if token in self.vocab:
+                token_ids.append(self.vocab[token])
+            else:
+                token_ids.append(self.unk_token_id)
+        
+        # Truncate if necessary
+        if truncation and len(token_ids) > max_length:
+            token_ids = token_ids[:max_length]
+            
+        # Pad if necessary
+        if padding == 'max_length':
+            while len(token_ids) < max_length:
+                token_ids.append(self.pad_token_id)
+                
+        # Return as tensor if requested
+        if return_tensors == 'pt':
+            return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
+        
+        return token_ids
+    
+    def decode(self, token_ids, skip_special_tokens=True):
+        """
+        Decode token IDs back to formula string.
+        
+        Args:
+            token_ids: List or tensor of token IDs
+            skip_special_tokens (bool): Whether to skip special tokens
+            
+        Returns:
+            str: Decoded formula string
+        """
+        if torch.is_tensor(token_ids):
+            token_ids = token_ids.tolist()
+            
+        tokens = []
+        for token_id in token_ids:
+            if token_id in self.id_to_token:
+                token = self.id_to_token[token_id]
+                
+                # Skip special tokens if requested
+                if skip_special_tokens and token in [self.pad_token, self.cls_token, 
+                                                   self.sep_token, self.unk_token]:
+                    continue
+                    
+                tokens.append(token)
+        
+        # Join tokens to form formula
+        return ''.join(tokens)
 
 # -----------------------------------------------------------------------------
 # Encoder-Decoder Transformer
@@ -240,7 +354,7 @@ def step_prediction(model: MassSelfiesED,
 # -----------------------------------------------------------------------------
 # MuZero transformer wrapper
 # -----------------------------------------------------------------------------
-@MODEL_REGISTRY.register('MuZeroSelfiesTransformer')
+@MODEL_REGISTRY.register('MuZeroSelfiesTransformer', force_overwrite=True)
 class MuZeroSelfiesTransformer(nn.Module):
     def __init__(self, observation_shape=4246, max_len=100,
                  d_model=512, n_enc=4, n_dec=6, n_head=8,
@@ -354,7 +468,7 @@ class MuZeroSelfiesTransformer(nn.Module):
 # -----------------------------------------------------------------------------
 # Enhanced MuZero transformer with formula masking and proper end detection
 # -----------------------------------------------------------------------------
-@MODEL_REGISTRY.register('MuZeroSelfiesTransformerEnhanced')
+@MODEL_REGISTRY.register('MuZeroSelfiesTransformerEnhanced', force_overwrite=True)
 class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
     def __init__(self, observation_shape=4246, max_len=100,
                  d_model=512, n_enc=4, n_dec=6, n_head=8,
@@ -376,7 +490,9 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         assert self.formula_start_idx + self.formula_max_len == observation_shape, \
             f"formula_start_idx + formula_max_len != observation_shape, {self.formula_start_idx} + {self.formula_max_len} != {observation_shape}"
         
-        self.bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        # Use custom chemical formula tokenizer instead of BERT
+        self.formula_tokenizer = ChemicalFormulaTokenizer(max_length=self.formula_max_len)
+        
         # Import the utility functions for action masking
         try:
             import sys
@@ -480,7 +596,8 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
             token_ids = formula_ids[batch_idx].tolist()
             # Decode formula tokens
             # try:
-            formula_str = self.bert_tokenizer.decode(token_ids, skip_special_tokens=True)
+            formula_str = self.formula_tokenizer.decode(token_ids, skip_special_tokens=True)
+            
             formula_strings.append(formula_str.strip())
             # except:
             #     formula_strings.append("")
@@ -520,12 +637,16 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                     remove_token="<REMOVE>",
                     special_tokens=[]
                 )
+                # available actions
+                # available_actions = [actions_list[i] for i in range(len(actions_list)) if action_mask[i]]
+                # print(f"debug: formula: {target_formula}\ncurrent selfies: {current_selfies}\ndebug: available actions: {available_actions}")
+                
                 mask_tensor = torch.tensor(action_mask, dtype=torch.bool, device=logits.device)
                 
                 # Use a safer masking approach
                 # Find the minimum logit value and subtract a reasonable amount
                 min_logit = masked_logits[batch_idx].min().item()
-                mask_value = min_logit - 10.0  # Subtract 10 from minimum to ensure masked actions have very low probability
+                mask_value = min_logit - 1e3  # Subtract 10 from minimum to ensure masked actions have very low probability
                 
                 masked_logits[batch_idx][~mask_tensor] = mask_value
                 
@@ -600,12 +721,56 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         # Check completion status
         completion_status = self._check_completion_status(current_selfies_list, formula_list)
         
+        # Compute reward using global reward network only if action is end token
+        if GLOBAL_REWARD_AVAILABLE and global_reward_network is not None:
+            try:
+                # Get the actions list to check if action is end token
+                global actions_list
+                if actions_list is None:
+                    actions_list = get_actions_list()
+                
+                # Find the index of the end token in actions list
+                end_token_idx = actions_list.index("<END>") if "<END>" in actions_list else -1
+                
+                # Check if the current action is the end token
+                action_idx = action.squeeze().long()
+                if action_idx.dim() == 0:  # Single action
+                    action_idx = action_idx.unsqueeze(0)
+                
+                reward_function = global_reward_network.get_reward_function()
+                batch_size = next_latent_state.size(0)
+                reward_scores = []
+                
+                for batch_idx in range(batch_size):
+                    current_action = action_idx[batch_idx].item() if batch_idx < len(action_idx) else action_idx[0].item()
+                    
+                    # Only use reward network if this is the end token action
+                    if current_action == end_token_idx:
+                        current_selfies = current_selfies_list[batch_idx]
+                        formula = formula_list[batch_idx] if batch_idx < len(formula_list) else ""
+                        spectrum_embed = next_latent_state[batch_idx, :self.spectrum_dim]
+                        
+                        # Compute reward using the global reward network
+                        similarity_score = reward_function(current_selfies, spectrum_embed, formula)
+                        reward_scores.append(similarity_score)
+                        # print(f"debug: current_action: {current_action}, end_token_idx: {end_token_idx}, similarity_score: {similarity_score}")
+                    else:
+                        # For non-end actions, use zero reward
+                        reward_scores.append(0.0)
+                
+                # Update reward tensor
+                reward = torch.tensor(reward_scores, device=next_latent_state.device).unsqueeze(-1)
+                
+            except Exception as e:
+                print(f"[WARN] Error computing reward with global network: {e}")
+                # Keep the original zero reward
+        
         # Print completion info if any molecule is complete
         if any(completion_status):
             complete_indices = [i for i, complete in enumerate(completion_status) if complete]
             print(f"Molecules complete at indices {complete_indices}")
             for idx in complete_indices:
-                print(f"  Batch {idx}: SELFIES='{current_selfies_list[idx]}', Formula='{formula_list[idx]}'")
+                print(f"  Batch {idx}: SELFIES='{current_selfies_list[idx]}', Formula='{formula_list[idx]}', Reward={reward[idx].item():.4f}")
         
         # Get transformer output - only use spectrum and SELFIES parts for transformer
         spectrum = next_latent_state[:, :self.spectrum_dim]
@@ -622,7 +787,12 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         # Apply formula-based action masking
         masked_logits = self._apply_formula_mask(logits, current_selfies_list, formula_list)
         value = value.unsqueeze(-1)
-
+        # print("debug: #########################")
+        # print("debug: current selfies: ", current_selfies_list[0])
+        # print("debug: formula: ", formula_list[0])
+        # for action in range(len(actions_list)):
+        #     print(f"debug: action: {actions_list[action]}, logit: {masked_logits[0, action]}")
+        # print("end of debug: #########################")
         return MZNetworkOutput(
             value=value, 
             reward=reward, 

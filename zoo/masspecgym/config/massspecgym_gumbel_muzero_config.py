@@ -1,19 +1,27 @@
 import os
+import multiprocessing as mp
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Set multiprocessing start method to 'spawn' to avoid CUDA re-initialization issues
+try:
+    mp.set_start_method('spawn', force=True)
+    print("[INFO] Set multiprocessing start method to 'spawn'")
+except RuntimeError:
+    print("[INFO] Multiprocessing start method already set")
+
 from easydict import EasyDict
 import numpy as np
-# import os
 
 # ==============================================================
 # begin of the most frequently changed config specified by the user
 # ==============================================================
-collector_env_num = 10
-n_episode = 10
+collector_env_num = 64
+n_episode = 64
 evaluator_env_num = 10
-num_simulations = 20
+num_simulations = 200
 update_per_collect = 100
-batch_size = 20
-max_env_step = int(300)
+batch_size = 128
+max_env_step = int(1e4)
 reanalyze_ratio = 0.
 # ==============================================================
 # end of the most frequently changed config specified by the user
@@ -40,7 +48,7 @@ massspecgym_gumbel_muzero_config = dict(
         reward_norm_scale=1.0,
         reward_type='cosine_similarity',
         max_len=100,
-        max_episode_steps=64,
+        max_episode_steps=32,
         channel_last=True,
         need_flatten=False,
 
@@ -79,7 +87,7 @@ massspecgym_gumbel_muzero_config = dict(
         update_per_collect=update_per_collect,
         batch_size=batch_size,
         optim_type='Adam',
-        max_num_considered_actions=2,
+        max_num_considered_actions=32,
         piecewise_decay_lr_scheduler=False,
         learning_rate=0.003,
         ssl_loss_weight=2,  
@@ -101,7 +109,7 @@ massspecgym_gumbel_muzero_create_config = dict(
         type='massgym_lightzero',
         import_names=['zoo.masspecgym.envs.massgym_wrapper'],
     ),
-    env_manager=dict(type='subprocess'),
+    env_manager=dict(type='subprocess', context='spawn'),
     policy=dict(
         type='gumbel_muzero',
         import_names=['lzero.policy.gumbel_muzero'],

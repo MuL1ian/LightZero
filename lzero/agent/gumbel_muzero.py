@@ -25,6 +25,15 @@ from lzero.policy.random_policy import LightZeroRandomPolicy
 from lzero.worker import MuZeroCollector as Collector
 from lzero.worker import MuZeroEvaluator as Evaluator
 
+# Import global reward network
+try:
+    from lzero.model import global_reward_network
+    GLOBAL_REWARD_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] Global reward network not available in agent: {e}")
+    GLOBAL_REWARD_AVAILABLE = False
+    global_reward_network = None
+
 
 class GumbelMuZeroAgent:
     """
@@ -122,6 +131,21 @@ class GumbelMuZeroAgent:
         self.checkpoint_save_dir = os.path.join(self.exp_name, "ckpt")
 
         self.env_fn, self.collector_env_cfg, self.evaluator_env_cfg = get_vec_env_setting(self.cfg.env)
+        
+        # Initialize global reward network if available
+        if GLOBAL_REWARD_AVAILABLE and global_reward_network is not None:
+            try:
+                global_reward_network.initialize_global_reward_network(
+                    device=self.cfg.policy.device,
+                    checkpoint_path=cfg.get('reward_network_checkpoint', None)
+                )
+                self.global_reward_manager = global_reward_network.get_global_reward_network()
+                print("[INFO] Global reward network initialized in agent")
+            except Exception as e:
+                print(f"[WARN] Failed to initialize global reward network in agent: {e}")
+                self.global_reward_manager = None
+        else:
+            self.global_reward_manager = None
 
     def train(
         self,
@@ -137,7 +161,13 @@ class GumbelMuZeroAgent:
         .. note::
             The method involves interacting with the environment, collecting experience, and optimizing the model.
         """
-
+        print(" GUMBEL MUZERO AGENT TRAINING STARTED ##########################")
+        print(" GUMBEL MUZERO AGENT TRAINING STARTED ##########################")
+        print(" GUMBEL MUZERO AGENT TRAINING STARTED ##########################")
+        print(" GUMBEL MUZERO AGENT TRAINING STARTED ##########################")
+        print(" GUMBEL MUZERO AGENT TRAINING STARTED ##########################")
+        print(" GUMBEL MUZERO AGENT TRAINING STARTED ##########################")
+        print(" GUMBEL MUZERO AGENT TRAINING STARTED ##########################")
         collector_env = create_env_manager(
             self.cfg.env.manager, [partial(self.env_fn, cfg=c) for c in self.collector_env_cfg]
         )
@@ -371,6 +401,13 @@ class GumbelMuZeroAgent:
         .. note::
             This method evaluates the agent's performance across multiple episodes to gauge its effectiveness.
         """
+        print(" GUMBEL MUZERO AGENT BATCH EVALUATE STARTED ##########################")
+        print(" GUMBEL MUZERO AGENT BATCH EVALUATE STARTED ##########################")     
+        print(" GUMBEL MUZERO AGENT BATCH EVALUATE STARTED ##########################")     
+        print(" GUMBEL MUZERO AGENT BATCH EVALUATE STARTED ##########################")     
+        print(" GUMBEL MUZERO AGENT BATCH EVALUATE STARTED ##########################")     
+        print(" GUMBEL MUZERO AGENT BATCH EVALUATE STARTED ##########################")     
+        print(" GUMBEL MUZERO AGENT BATCH EVALUATE STARTED ##########################")     
         evaluator_env = create_env_manager(
             self.cfg.env.manager, [partial(self.env_fn, cfg=c) for c in self.evaluator_env_cfg]
         )

@@ -982,6 +982,8 @@ class GumbelMuZeroMCTSCtree(object):
         root_noise_weight=0.25,
         # (float) The maximum change in value allowed during the backup step of the search tree update.
         value_delta_max=0.01,
+        # (float) The gumbel scale for the gumbel noise.
+        gumbel_scale=10.0,
     )
 
     @classmethod

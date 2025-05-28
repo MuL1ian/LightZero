@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from ding.model import model_wrap
 from ding.torch_utils import to_tensor
@@ -16,7 +17,16 @@ from lzero.policy import scalar_transform, InverseScalarTransform, cross_entropy
     DiscreteSupport, to_torch_float_tensor, mz_network_output_unpack, select_action, negative_cosine_similarity, \
     prepare_obs, \
     configure_optimizers
-from lzero.policy.muzero import MuZeroPolicy, GumbelMuZeroPolicy
+from lzero.policy.muzero import MuZeroPolicy 
+
+# Import global reward network
+try:
+    from lzero.model import global_reward_network
+    GLOBAL_REWARD_AVAILABLE = True
+except ImportError as e:
+    print(f"[WARN] Global reward network not available in GAG MuZero: {e}")
+    GLOBAL_REWARD_AVAILABLE = False
+    global_reward_network = None
 
 @POLICY_REGISTRY.register('gag_muzero')
 class GAGMuZeroPolicy(MuZeroPolicy):
@@ -191,6 +201,26 @@ class GAGMuZeroPolicy(MuZeroPolicy):
             # (int) The decay steps from start to end eps.
             decay=int(1e5),
         ),
+        
+        # ****** Global Reward Network ******
+        # (int) Vocabulary size for SELFIES tokenizer in reward network.
+        reward_vocab_size=1000,
+        # (int) Maximum SELFIES sequence length for reward network.
+        max_selfies_len=100,
+        # (str) Path to pretrained reward network checkpoint.
+        reward_network_checkpoint=None,
+        # (bool) Whether to use global reward network for reward computation.
+        use_global_reward_network=True,
+        
+        # ****** Adversarial Training ******
+        # (float) Learning rate for reward network adversarial training.
+        reward_learning_rate=1e-4,
+        # (float) Weight decay for reward network optimizer.
+        reward_weight_decay=1e-5,
+        # (float) Weight for L2 regularization on reward predictions.
+        reward_regularization_weight=0.01,
+        # (bool) Whether to enable adversarial training.
+        enable_adversarial_training=True,
     )
     def _adversarial_reward_loss(self, policy_logits, improved_policy_batch, mask_batch):
         """
@@ -204,9 +234,85 @@ class GAGMuZeroPolicy(MuZeroPolicy):
     def _init_learn(self) -> None:
         """
         Overview:
-            Initialize the learn mode of the policy.
+            Learn mode init method. Called by ``self.__init__``. Initialize the learn model, optimizer and MCTS utils.
         """
-        pass
+        assert self._cfg.optim_type in ['SGD', 'Adam', 'AdamW'], self._cfg.optim_type
+        # NOTE: in board_games, for fixed lr 0.003, 'Adam' is better than 'SGD'.
+        if self._cfg.optim_type == 'SGD':
+            self._optimizer = optim.SGD(
+                self._model.parameters(),
+                lr=self._cfg.learning_rate,
+                momentum=self._cfg.momentum,
+                weight_decay=self._cfg.weight_decay,
+            )
+        elif self._cfg.optim_type == 'Adam':
+            self._optimizer = optim.Adam(
+                self._model.parameters(), lr=self._cfg.learning_rate, weight_decay=self._cfg.weight_decay
+            )
+        elif self._cfg.optim_type == 'AdamW':
+            self._optimizer = configure_optimizers(model=self._model, weight_decay=self._cfg.weight_decay,
+                                                   learning_rate=self._cfg.learning_rate, device_type=self._cfg.device)
+
+        if self._cfg.piecewise_decay_lr_scheduler:
+            from torch.optim.lr_scheduler import LambdaLR
+            max_step = self._cfg.threshold_training_steps_for_final_lr
+            # NOTE: the 1, 0.1, 0.01 is the decay rate, not the lr.
+            lr_lambda = lambda step: 1 if step < max_step * 0.5 else (0.1 if step < max_step else 0.01)  # noqa
+            self.lr_scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda)
+
+        # use model_wrapper for specialized demands of different modes
+        self._target_model = copy.deepcopy(self._model)
+        self._target_model = model_wrap(
+            self._target_model,
+            wrapper_name='target',
+            update_type='assign',
+            update_kwargs={'freq': self._cfg.target_update_freq}
+        )
+        self._learn_model = self._model
+
+        if self._cfg.use_augmentation:
+            self.image_transforms = ImageTransforms(
+                self._cfg.augmentation,
+                image_shape=(self._cfg.model.observation_shape[1], self._cfg.model.observation_shape[2])
+            )
+        self.value_support = DiscreteSupport(-self._cfg.model.support_scale, self._cfg.model.support_scale, delta=1)
+        self.reward_support = DiscreteSupport(-self._cfg.model.support_scale, self._cfg.model.support_scale, delta=1)
+        self.inverse_scalar_transform_handle = InverseScalarTransform(
+            self._cfg.model.support_scale, self._cfg.device, self._cfg.model.categorical_distribution
+        )
+        self.kl_loss = KLDivLoss(reduction='none')
+        
+        # Initialize global reward network if available
+        if GLOBAL_REWARD_AVAILABLE and global_reward_network is not None:
+            try:
+                global_reward_network.initialize_global_reward_network(
+                    vocab_size=getattr(self._cfg, 'reward_vocab_size', 1000),
+                    max_selfies_len=getattr(self._cfg, 'max_selfies_len', 100),
+                    device=self._cfg.device,
+                    checkpoint_path=getattr(self._cfg, 'reward_network_checkpoint', None)
+                )
+                self.reward_function = global_reward_network.get_reward_function()
+                self.reward_network = global_reward_network.get_reward_network()
+                
+                # Initialize optimizer for reward network adversarial training
+                if self.reward_network is not None:
+                    self.reward_optimizer = optim.Adam(
+                        self.reward_network.parameters(),
+                        lr=getattr(self._cfg, 'reward_learning_rate', 1e-4),
+                        weight_decay=getattr(self._cfg, 'reward_weight_decay', 1e-5)
+                    )
+                    print("[INFO] Reward network optimizer initialized for adversarial training")
+                
+                print("[INFO] Global reward network initialized in GAG MuZero policy")
+            except Exception as e:
+                print(f"[WARN] Failed to initialize global reward network in GAG MuZero: {e}")
+                self.reward_function = None
+                self.reward_network = None
+                self.reward_optimizer = None
+        else:
+            self.reward_function = None
+            self.reward_network = None
+            self.reward_optimizer = None
 
     def _forward_learn(self, data: torch.Tensor) -> Dict[str, Union[float, int]]:
         """
@@ -287,14 +393,287 @@ class GAGMuZeroPolicy(MuZeroPolicy):
         if self._cfg.piecewise_decay_lr_scheduler:
             self.lr_scheduler.step()
 
+        # Generative Adversarial Training with Preference Learning
+        reward_loss = 0.0
+        adversarial_loss = 0.0
+        if (self.reward_network is not None and hasattr(self, 'reward_function') and 
+            getattr(self._cfg, 'enable_adversarial_training', True)):
+            try:
+                # Extract spectrum data and SELFIES from observation batch
+                positive_data, negative_data = self._extract_adversarial_training_data(
+                    obs_batch, latent_state, action_batch, mask_batch
+                )
+                
+                if positive_data is not None and negative_data is not None:
+                    # Compute preference learning loss
+                    preference_loss = self._compute_preference_loss(positive_data, negative_data)
+                    
+                    # Update reward network with adversarial training
+                    if hasattr(self, 'reward_optimizer'):
+                        self.reward_optimizer.zero_grad()
+                        preference_loss.backward(retain_graph=True)
+                        self.reward_optimizer.step()
+                        
+                        reward_loss = preference_loss.item()
+                        adversarial_loss = preference_loss.item()
+                    
+                # Update step count for logging
+                if hasattr(self, '_reward_network_step_count'):
+                    self._reward_network_step_count += 1
+                else:
+                    self._reward_network_step_count = 1
+                    
+                if self._reward_network_step_count % 100 == 0:
+                    print(f"[INFO] Adversarial reward training step {self._reward_network_step_count}, loss: {reward_loss:.4f}")
+                    
+            except Exception as e:
+                print(f"[WARN] Error in adversarial reward network training: {e}")
+                import traceback
+                traceback.print_exc()
+
         return {
             'cur_lr': self._optimizer.param_groups[0]['lr'],
             'weighted_total_loss': weighted_total_loss.item(),
             'total_loss': total_loss.mean().item(),
             'policy_loss': policy_loss.mean().item(),
             'value_loss': value_loss.mean().item(),
+            'reward_loss': reward_loss,
+            'adversarial_loss': adversarial_loss,
             'total_grad_norm_before_clip': total_grad_norm_before_clip.item()
         }
+
+    def _extract_adversarial_training_data(self, obs_batch, latent_state, action_batch, mask_batch):
+        """
+        Extract positive (training data) and negative (generated) examples for adversarial training.
+        
+        Args:
+            obs_batch: Observation batch containing spectrum + formula + selfies
+            latent_state: Current latent state from the model
+            action_batch: Action batch for generating negative examples
+            mask_batch: Mask for valid timesteps
+            
+        Returns:
+            tuple: (positive_data, negative_data) where each contains:
+                - selfies_tokens: Tokenized SELFIES
+                - selfies_mask: Attention mask for SELFIES
+                - spectrum_batch: Spectrum data in reward network format
+        """
+        try:
+            batch_size = obs_batch.shape[0]
+            
+            # Extract components from observation (spectrum + selfies + formula)
+            # Based on massgymenv.py: spectrum (4096) + selfies (100) + formula (50) = 4246
+            spectrum_embeds = obs_batch[:, :4096]  # Pre-computed spectrum embeddings
+            selfies_tokens = obs_batch[:, 4096:4196].long()  # SELFIES tokens
+            formula_tokens = obs_batch[:, 4196:4246].long()  # Formula tokens
+            
+            # Positive examples: Use the training data (current observations)
+            positive_data = self._prepare_reward_network_data(
+                spectrum_embeds, selfies_tokens, formula_tokens, is_positive=True
+            )
+            
+            # Negative examples: Generate from current policy
+            negative_data = self._generate_negative_examples(
+                spectrum_embeds, latent_state, action_batch, mask_batch
+            )
+            
+            return positive_data, negative_data
+            
+        except Exception as e:
+            print(f"[WARN] Error extracting adversarial training data: {e}")
+            return None, None
+
+    def _prepare_reward_network_data(self, spectrum_embeds, selfies_tokens, formula_tokens, is_positive=True):
+        """
+        Prepare data in the format expected by the reward network.
+        
+        Args:
+            spectrum_embeds: Pre-computed spectrum embeddings [batch_size, 4096]
+            selfies_tokens: SELFIES token IDs [batch_size, max_len]
+            formula_tokens: Formula token IDs [batch_size, formula_max_len]
+            is_positive: Whether this is positive training data
+            
+        Returns:
+            dict: Data formatted for reward network input
+        """
+        try:
+            batch_size = spectrum_embeds.shape[0]
+            
+            # Create attention mask for SELFIES (non-zero tokens are valid)
+            selfies_mask = (selfies_tokens != 0).long()
+            
+            # For the reward network, we need to create spectrum_batch in the format expected by PeakFormula
+            # Since we have pre-computed embeddings, we'll create a dummy spectrum batch
+            # and use the embeddings directly in the reward network
+            spectrum_batch = {
+                'peaks': torch.zeros(batch_size, 100, 2).to(spectrum_embeds.device),  # Dummy peaks
+                'num_peaks': torch.full((batch_size,), 100).to(spectrum_embeds.device),
+                'precursor_mz': torch.zeros(batch_size).to(spectrum_embeds.device),
+                'spectrum_embeds': spectrum_embeds,  # Use pre-computed embeddings
+            }
+            
+            return {
+                'selfies_tokens': selfies_tokens,
+                'selfies_mask': selfies_mask,
+                'spectrum_batch': spectrum_batch,
+                'is_positive': is_positive
+            }
+            
+        except Exception as e:
+            print(f"[WARN] Error preparing reward network data: {e}")
+            return None
+
+    def _generate_negative_examples(self, spectrum_embeds, latent_state, action_batch, mask_batch):
+        """
+        Generate negative examples by sampling from the current policy.
+        
+        Args:
+            spectrum_embeds: Spectrum embeddings [batch_size, 4096]
+            latent_state: Current latent state from model
+            action_batch: Action batch for reference
+            mask_batch: Mask for valid timesteps
+            
+        Returns:
+            dict: Negative examples in reward network format
+        """
+        try:
+            batch_size = spectrum_embeds.shape[0]
+            device = spectrum_embeds.device
+            
+            # Generate negative SELFIES by sampling from the current policy
+            # This is a simplified approach - in practice, you might want to use MCTS rollouts
+            negative_selfies_tokens = self._sample_negative_selfies(batch_size, device)
+            
+            # Create attention mask for negative SELFIES
+            negative_selfies_mask = (negative_selfies_tokens != 0).long()
+            
+            # Use the same spectrum embeddings but with generated (negative) SELFIES
+            spectrum_batch = {
+                'peaks': torch.zeros(batch_size, 100, 2).to(device),  # Dummy peaks
+                'num_peaks': torch.full((batch_size,), 100).to(device),
+                'precursor_mz': torch.zeros(batch_size).to(device),
+                'spectrum_embeds': spectrum_embeds,  # Same spectrum, different molecules
+            }
+            
+            return {
+                'selfies_tokens': negative_selfies_tokens,
+                'selfies_mask': negative_selfies_mask,
+                'spectrum_batch': spectrum_batch,
+                'is_positive': False
+            }
+            
+        except Exception as e:
+            print(f"[WARN] Error generating negative examples: {e}")
+            return None
+
+    def _sample_negative_selfies(self, batch_size, device):
+        """
+        Sample negative SELFIES sequences from the current policy.
+        
+        Args:
+            batch_size: Number of negative examples to generate
+            device: Device to create tensors on
+            
+        Returns:
+            torch.Tensor: Negative SELFIES token sequences [batch_size, max_len]
+        """
+        try:
+            max_len = getattr(self._cfg, 'max_selfies_len', 100)
+            vocab_size = min(getattr(self._cfg, 'reward_vocab_size', 1000), 500)  # Limit vocab size
+            
+            # Simple random sampling for negative examples
+            # In practice, you might want to use the current policy to generate more realistic negatives
+            negative_tokens = torch.randint(
+                1, vocab_size, (batch_size, max_len), device=device
+            )
+            
+            # Add some padding to make it more realistic
+            for i in range(batch_size):
+                # Random length between 10 and max_len
+                seq_len = torch.randint(10, max_len, (1,)).item()
+                negative_tokens[i, seq_len:] = 0  # Pad with zeros
+            
+            return negative_tokens
+            
+        except Exception as e:
+            print(f"[WARN] Error sampling negative SELFIES: {e}")
+            # Return dummy tokens as fallback
+            max_len = getattr(self._cfg, 'max_selfies_len', 100)
+            return torch.zeros(batch_size, max_len, device=device, dtype=torch.long)
+
+    def _compute_preference_loss(self, positive_data, negative_data):
+        """
+        Compute RLHF-style pairwise preference loss for adversarial training.
+        
+        Uses the Bradley-Terry model from RLHF where the probability that positive
+        example is preferred over negative example is modeled as:
+        P(positive > negative) = sigmoid(reward(positive) - reward(negative))
+        
+        The loss is: -log(sigmoid(reward(positive) - reward(negative)))
+        
+        Args:
+            positive_data: Positive training examples (preferred)
+            negative_data: Negative generated examples (not preferred)
+            
+        Returns:
+            torch.Tensor: RLHF-style pairwise preference loss
+        """
+        try:
+            # Get similarity scores from reward network (these act as rewards)
+            positive_rewards = self.reward_network.predict_similarity(
+                positive_data['selfies_tokens'],
+                positive_data['selfies_mask'],
+                positive_data['spectrum_batch']
+            )
+            
+            negative_rewards = self.reward_network.predict_similarity(
+                negative_data['selfies_tokens'],
+                negative_data['selfies_mask'],
+                negative_data['spectrum_batch']
+            )
+            
+            # RLHF-style pairwise preference loss using Bradley-Terry model
+            # P(positive > negative) = sigmoid(reward_positive - reward_negative)
+            # Loss = -log(P(positive > negative)) = -log(sigmoid(reward_positive - reward_negative))
+            # This is equivalent to: log(1 + exp(-(reward_positive - reward_negative)))
+            # Which is the same as: F.softplus(-(reward_positive - reward_negative))
+            
+            reward_diff = positive_rewards - negative_rewards
+            preference_loss = F.softplus(-reward_diff).mean()
+            
+            # Optional: Add regularization to prevent reward collapse
+            # Encourage diversity in reward predictions
+            reward_regularization = getattr(self._cfg, 'reward_regularization_weight', 0.01)
+            if reward_regularization > 0:
+                # L2 regularization on rewards to prevent them from becoming too large
+                positive_reg = (positive_rewards ** 2).mean()
+                negative_reg = (negative_rewards ** 2).mean()
+                regularization_loss = reward_regularization * (positive_reg + negative_reg)
+            else:
+                regularization_loss = 0.0
+            
+            total_loss = preference_loss + regularization_loss
+            
+            # Log some statistics for monitoring
+            if hasattr(self, '_preference_step_count'):
+                self._preference_step_count += 1
+            else:
+                self._preference_step_count = 1
+                
+            if self._preference_step_count % 100 == 0:
+                with torch.no_grad():
+                    accuracy = (reward_diff > 0).float().mean()
+                    print(f"[INFO] Preference accuracy: {accuracy.item():.3f}, "
+                          f"Avg reward diff: {reward_diff.mean().item():.3f}, "
+                          f"Loss: {preference_loss.item():.4f}")
+            
+            return total_loss
+            
+        except Exception as e:
+            print(f"[WARN] Error computing RLHF preference loss: {e}")
+            import traceback
+            traceback.print_exc()
+            return torch.tensor(0.0, device=self._cfg.device, requires_grad=True)
 
     def _forward_collect(
             self,
@@ -376,3 +755,103 @@ class GAGMuZeroPolicy(MuZeroPolicy):
 
         return output
 
+    def _init_eval(self) -> None:
+        """
+        Overview:
+            Evaluate mode init method. Called by ``self.__init__``. Initialize the eval model and MCTS utils.
+        """
+        self._eval_model = self._model
+        if self._cfg.mcts_ctree:
+            self._mcts_eval = MCTSCtree(self._cfg)
+        else:
+            self._mcts_eval = MCTSPtree(self._cfg)
+
+    def _forward_eval(self, data: torch.Tensor, action_mask: list, to_play: List = [-1],
+                      ready_env_id: np.array = None, **kwargs) -> Dict:
+        """
+        Overview:
+            The forward function for evaluating the current policy in eval mode. Use model to execute MCTS search.
+            Choosing the action with the highest value (argmax) rather than sampling during the eval mode.
+        Arguments:
+            - data (:obj:`torch.Tensor`): The input data, i.e. the observation.
+            - action_mask (:obj:`list`): The action mask, i.e. the action that cannot be selected.
+            - to_play (:obj:`int`): The player to play.
+            - ready_env_id (:obj:`list`): The id of the env that is ready to collect.
+        Shape:
+            - data (:obj:`torch.Tensor`):
+                - For Atari, :math:`(N, C*S, H, W)`, where N is the number of collect_env, C is the number of channels, \
+                    S is the number of stacked frames, H is the height of the image, W is the width of the image.
+                - For lunarlander, :math:`(N, O)`, where N is the number of collect_env, O is the observation space size.
+            - action_mask: :math:`(N, action_space_size)`, where N is the number of collect_env.
+            - to_play: :math:`(N, 1)`, where N is the number of collect_env.
+            - ready_env_id: None
+        Returns:
+            - output (:obj:`Dict[int, Any]`): Dict type data, the keys including ``action``, ``distributions``, \
+                ``visit_count_distribution_entropy``, ``value``, ``pred_value``, ``policy_logits``.
+        """
+        self._eval_model.eval()
+        active_eval_env_num = data.shape[0]
+        if ready_env_id is None:
+            ready_env_id = np.arange(active_eval_env_num)
+        output = {i: None for i in ready_env_id}
+        with torch.no_grad():
+            # data shape [B, S x C, W, H], e.g. {Tensor:(B, 12, 96, 96)}
+            network_output = self._collect_model.initial_inference(data)
+            latent_state_roots, reward_roots, pred_values, policy_logits = mz_network_output_unpack(network_output)
+
+            if not self._eval_model.training:
+                # if not in training, obtain the scalars of the value/reward
+                pred_values = self.inverse_scalar_transform_handle(pred_values).detach().cpu().numpy()  # shape（B, 1）
+                latent_state_roots = latent_state_roots.detach().cpu().numpy()
+                policy_logits = policy_logits.detach().cpu().numpy().tolist()  # list shape（B, A）
+
+            legal_actions = [[i for i, x in enumerate(action_mask[j]) if x == 1] for j in range(active_eval_env_num)]
+            if self._cfg.mcts_ctree:
+                # cpp mcts_tree
+                roots = MCTSCtree.roots(active_eval_env_num, legal_actions)
+            else:
+                # python mcts_tree
+                roots = MCTSPtree.roots(active_eval_env_num, legal_actions)
+            roots.prepare_no_noise(reward_roots, list(pred_values), policy_logits, to_play)
+            self._mcts_eval.search(roots, self._eval_model, latent_state_roots, to_play)
+
+            # list of list, shape: ``{list: batch_size} -> {list: action_space_size}``
+            roots_visit_count_distributions = roots.get_distributions()
+            roots_values = roots.get_values()  # shape: {list: batch_size}
+
+            # ==============================================================
+            # The core difference between GumbelMuZero and MuZero
+            # ==============================================================
+            # Gumbel MuZero selects the action according to the improved policy
+            roots_improved_policy_probs = roots.get_policies(self._cfg.discount_factor,
+                                                             self._cfg.model.action_space_size)  # new policy constructed with completed Q in gumbel muzero
+            roots_improved_policy_probs = np.array(roots_improved_policy_probs)
+
+            for i, env_id in enumerate(ready_env_id):
+                distributions, value, improved_policy_probs = roots_visit_count_distributions[i], roots_values[i], \
+                roots_improved_policy_probs[i]
+                # NOTE: Only legal actions possess visit counts, so the ``action_index_in_legal_action_set`` represents
+                # the index within the legal action set, rather than the index in the entire action set.
+                #  Setting deterministic=True implies choosing the action with the highest value (argmax) rather than
+                # sampling during the evaluation phase.
+                action_index_in_legal_action_set, visit_count_distribution_entropy = select_action(
+                    distributions, temperature=1, deterministic=True
+                )
+                # NOTE: Convert the ``action_index_in_legal_action_set`` to the corresponding ``action`` in the
+                # entire action set.
+                # action = np.where(action_mask[i] == 1.0)[0][action_index_in_legal_action_set]
+
+                valid_value = np.where(action_mask[i] == 1.0, improved_policy_probs, 0.0)
+                # print("debug: valid_value: ", valid_value)
+                action = np.argmax([v for v in valid_value])
+
+                output[env_id] = {
+                    'action': action,
+                    'visit_count_distributions': distributions,
+                    'visit_count_distribution_entropy': visit_count_distribution_entropy,
+                    'searched_value': value,
+                    'predicted_value': pred_values[i],
+                    'predicted_policy_logits': policy_logits[i],
+                }
+
+        return output

@@ -134,7 +134,9 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         # (int) the number of simulations in MCTS.
         num_simulations=50,
         # (int) the max considred number in Gumbel MuZero MCTS simulation.
-        max_num_considered_actions=4,
+        max_num_considered_actions=32,
+
+        gumbel_scale=10.0,
         # (float) Discount factor (gamma) for returns.
         discount_factor=0.997,
         # (int) The number of step for calculating target q_value.
@@ -464,10 +466,10 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         if self._cfg.monitor_extra_statistics:
             predicted_rewards = torch.stack(predicted_rewards).transpose(1, 0).squeeze(-1)
             predicted_rewards = predicted_rewards.reshape(-1).unsqueeze(-1)
-        print("policy_loss: ", policy_loss.mean().item())
-        print("value: ", value.mean().item())
-        print("target_value: ", target_value.mean().item())
-        print("value_loss: ", value_loss.mean().item())
+        # print("policy_loss: ", policy_loss.mean().item())
+        # print("value: ", value.mean().item())
+        # print("target_value: ", target_value.mean().item())
+        # print("value_loss: ", value_loss.mean().item())
         return {
             'collect_mcts_temperature': self._collect_mcts_temperature,
             'cur_lr': self._optimizer.param_groups[0]['lr'],

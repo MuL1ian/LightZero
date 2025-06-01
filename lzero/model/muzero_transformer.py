@@ -278,6 +278,49 @@ class MassSelfiesED(nn.Module):
     def _generate_square_subsequent_mask(self, sz: int) -> torch.Tensor:
         return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
 
+    def forward_pretrain(
+        self,
+        spectrum_embed: torch.Tensor,
+        tgt_tokens: torch.Tensor,
+        tgt_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        前向传播用于预训练 - 返回完整序列的logits
+        
+        Args:
+            spectrum_embed: (B, spectrum_dim) 质谱嵌入
+            tgt_tokens: (B, T) 目标token序列
+            tgt_mask: (B, T) attention mask
+            
+        Returns:
+            torch.Tensor: (B, T, vocab_size) 每个位置的logits
+        """
+        spectrum_embed = spectrum_embed.to(self.device)
+        tgt_tokens = tgt_tokens.long().to(self.device)
+        tgt_mask = tgt_mask.to(self.device)
+        B, T = tgt_tokens.shape
+
+        # Encoder
+        enc_feat = self.spec_proj(spectrum_embed)       # (B, d_model)
+        mem = self.encoder(enc_feat.unsqueeze(1))       # (B, 1, d_model)
+
+        # Decoder
+        pos_ids = torch.arange(T, device=self.device).unsqueeze(0).expand(B, -1)
+        dec_in = self.token_embed(tgt_tokens) + self.pos_embed(pos_ids)
+        causal = self._generate_square_subsequent_mask(T).to(self.device)
+        
+        dec_out = self.decoder(
+            tgt=dec_in, 
+            memory=mem,
+            tgt_mask=causal,
+            tgt_key_padding_mask=(tgt_mask == 0)
+        )  # (B, T, d_model)
+
+        # 获取每个位置的logits
+        logits = self.action_head(dec_out)  # (B, T, vocab_size)
+        
+        return logits
+
     def forward(
         self,
         combined_embed: torch.Tensor,

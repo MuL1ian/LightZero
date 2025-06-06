@@ -136,7 +136,7 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         # (int) the max considred number in Gumbel MuZero MCTS simulation.
         max_num_considered_actions=32,
 
-        gumbel_scale=10.0,
+        gumbel_scale=1.0,
         # (float) Discount factor (gamma) for returns.
         discount_factor=0.997,
         # (int) The number of step for calculating target q_value.
@@ -359,16 +359,27 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         # In Gumbel MuZero, the policy loss is defined as the KL loss between current policy and improved policy calculated in MCTS.
         # print("policy_logits shape: ", policy_logits.shape)
         # print("improved_policy_batch[:, 0] shape: ", improved_policy_batch[:, 0].shape)
-        policy_loss = self.kl_loss(torch.log(torch.softmax(policy_logits, dim=1)),
-                                   torch.from_numpy(improved_policy_batch[:, 0]).to(self._cfg.device).detach().float())
+        # === Numerically stable KL-divergence ===
+        pred_probs = torch.softmax(policy_logits, dim=1)
+        pred_probs = torch.clamp(pred_probs, min=1e-8)  # avoid log(0)
+        log_pred  = torch.log(pred_probs)
+
+        target_probs = torch.from_numpy(improved_policy_batch[:, 0]).to(self._cfg.device).detach().float()
+        target_probs = torch.clamp(target_probs, min=1e-8)  # avoid 0 * log(0)
+        target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)  # re-normalise
+
+        policy_loss = self.kl_loss(log_pred, target_probs)
         policy_loss = policy_loss.mean(dim=-1) * mask_batch[:, 0]
         # Output the entropy for experimental observation.
 
         prob = torch.softmax(policy_logits, dim=-1)
+        prob = torch.clamp(prob, min=1e-8)
         policy_entropy = -(prob * prob.log()).sum(-1)
 
         # value_loss = cross_entropy_loss(value, target_value_categorical[:, 0])
-        value_loss = L1Loss(reduction='none')(value, target_value[:, 0]).mean(dim=-1) * mask_batch[:, 0]
+        # Align shapes for L1Loss: predicted `value` has shape [B,1] while target_value[:,0] is [B].
+        # Squeeze the last dimension to silence broadcasting warnings and ensure correctness.
+        value_loss = L1Loss(reduction='none')(value.squeeze(-1), target_value[:, 0]).mean(dim=-1) * mask_batch[:, 0]
 
         reward_loss = torch.zeros(self._cfg.batch_size, device=self._cfg.device)
         consistency_loss = torch.zeros(self._cfg.batch_size, device=self._cfg.device)
@@ -405,24 +416,26 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
                     temp_loss = negative_cosine_similarity(dynamic_proj, observation_proj) * mask_batch[:, step_k]
                     consistency_loss += temp_loss
 
-            # NOTE: the target policy, target_value_categorical, target_reward_categorical is calculated in
-            # game buffer now.
-            # ==============================================================
-            # calculate policy loss for the next ``num_unroll_steps`` unroll steps.
-            # NOTE: the +=.
-            # ==============================================================
-            # print("debug: policy_logits: ", policy_logits)
-            # print("debug: improved_policy_batch[:, step_k + 1]: ", improved_policy_batch[:, step_k + 1])
-            policy_loss += self.kl_loss(torch.log(torch.softmax(policy_logits, dim=1)),
-                                        torch.from_numpy(improved_policy_batch[:, step_k + 1]).to(
-                                            self._cfg.device).detach().float()).mean(dim=-1) * mask_batch[:, step_k + 1]
+            # === Numerically stable KL-divergence for unrolled steps ===
+            pred_probs = torch.softmax(policy_logits, dim=1)
+            pred_probs = torch.clamp(pred_probs, min=1e-8)
+            log_pred  = torch.log(pred_probs)
+
+            target_probs = torch.from_numpy(improved_policy_batch[:, step_k + 1]).to(self._cfg.device).detach().float()
+            target_probs = torch.clamp(target_probs, min=1e-8)
+            target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
+
+            policy_loss += self.kl_loss(log_pred, target_probs).mean(dim=-1) * mask_batch[:, step_k + 1]
+            assert not torch.isnan(policy_loss).any(), f"policy_loss has nan: {policy_loss}"
             # value_loss += cross_entropy_loss(value, target_value_categorical[:, step_k + 1])
             # reward_loss += cross_entropy_loss(reward, target_reward_categorical[:, step_k])
-            value_loss += L1Loss(reduction='none')(value, target_value[:, step_k + 1]).mean(dim=-1) * mask_batch[:, step_k + 1]
-            reward_loss += L1Loss(reduction='none')(reward, target_reward[:, step_k]).mean(dim=-1) * mask_batch[:, step_k]
+            # reward_loss += cross_entropy_loss(reward, target_reward_categorical[:, step_k])
+            value_loss += L1Loss(reduction='none')(value.squeeze(-1), target_value[:, step_k + 1]).mean(dim=-1) * mask_batch[:, step_k + 1]
+            reward_loss += L1Loss(reduction='none')(reward.squeeze(-1), target_reward[:, step_k]).mean(dim=-1) * mask_batch[:, step_k]
 
 
             prob = torch.softmax(policy_logits, dim=-1)
+            prob = torch.clamp(prob, min=1e-8)
             policy_entropy += (prob * prob.log()).sum(-1)
 
             if self._cfg.monitor_extra_statistics:

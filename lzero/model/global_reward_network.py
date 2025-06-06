@@ -29,10 +29,15 @@ _lock = threading.Lock()
 
 # Reward server globals
 _reward_server = None
-_reward_server_process = None
+_reward_processor_process = None  # Renamed from _reward_server_process
+_queue_manager_process = None     # New: separate process for queue management
 _request_queue = None
-_response_queue = None
+_response_dict = None             # Changed from response_queue to response_dict
+_processor_request_queue = None   # Queue Manager -> Reward Processor (requests)
+_processor_response_queue = None  # Reward Processor -> Queue Manager (responses)
 _server_enabled = False
+_client_timeout = 5.0  # Default client timeout for server communication
+_multiprocessing_manager = None   # Manager for shared response dictionary
 
 # Try to import dependencies, but don't fail if they're not available
 try:
@@ -207,7 +212,8 @@ def initialize_global_reward_network(
     enable_batching: bool = False,
     batch_size: int = 32,
     batch_timeout: float = 0.1,
-    use_reward_server: bool = None  # New parameter
+    use_reward_server: bool = None,  # New parameter
+    client_timeout: float = None  # New parameter for client-side timeout
 ):
     """
     Initialize the global reward network.
@@ -227,8 +233,10 @@ def initialize_global_reward_network(
         batch_timeout: Timeout for batched computation (seconds)
         use_reward_server: Whether to use reward server for subprocess environments.
                           If None, auto-detects based on multiprocessing context.
+        client_timeout: Timeout for client requests to reward server (seconds).
+                       If None, auto-calculated as min(60.0, max(5.0, batch_timeout * 10 + 5)).
     """
-    global _global_reward_network, _global_reward_function, _global_device
+    global _global_reward_network, _global_reward_function, _global_device, _client_timeout
     
     print("[INFO] Initializing global reward network...")
     
@@ -239,7 +247,19 @@ def initialize_global_reward_network(
             
         if device is not None:
             _global_device = torch.device(device)
-            
+        
+        # Set client timeout based on batch timeout if not provided
+        if client_timeout is None:
+            # Client timeout should be larger than batch timeout to allow for:
+            # 1. Batching delay (batch_timeout)
+            # 2. Network processing time
+            # 3. Inter-process communication overhead
+            # 4. Multiple batches if the request gets queued
+            # Auto-calculate: minimum 5s, maximum 60s, or batch_timeout * 10 + 5
+            _client_timeout = min(60.0, max(5.0, batch_timeout * 10 + 5))
+        else:
+            _client_timeout = client_timeout
+        
         # Set default checkpoint path if none provided
         if checkpoint_path is None:
             # Try to find the default checkpoint path relative to the current file
@@ -253,30 +273,12 @@ def initialize_global_reward_network(
             
             if os.path.exists(default_checkpoint_path):
                 checkpoint_path = default_checkpoint_path
-                print(f"[INFO] Using default checkpoint path: {checkpoint_path}")
-            else:
-                print(f"[WARN] Default checkpoint not found at: {default_checkpoint_path}")
-                print("[INFO] Continuing without checkpoint")
         
         # Auto-detect whether to use reward server
         if use_reward_server is None:
             # Check if we're in a subprocess environment
             current_process = mp.current_process()
             use_reward_server = current_process.name != 'MainProcess'
-            if use_reward_server:
-                print(f"[INFO] Auto-detected subprocess environment '{current_process.name}', using reward server")
-            else:
-                print("[INFO] Auto-detected main process, checking configuration for reward server...")
-        
-        # If use_reward_server is explicitly set to True, respect that setting
-        if use_reward_server:
-            current_process = mp.current_process()
-            if current_process.name == 'MainProcess':
-                print("[INFO] Main process configured to use reward server, starting server...")
-            else:
-                print(f"[INFO] Subprocess '{current_process.name}' configured to use reward server, connecting to server...")
-        else:
-            print("[INFO] Using direct reward computation")
         
         # Initialize tokenizer
         tokenizer = None
@@ -288,15 +290,12 @@ def initialize_global_reward_network(
                     tokenizer = SelfiesTokenizer(max_len=max_selfies_len)
                     if vocab_size is None:
                         vocab_size = len(tokenizer.get_vocab())
-                    print("[INFO] Using real SelfiesTokenizer")
                 except ImportError:
                     # Fallback to dummy tokenizer
                     tokenizer = DummyTokenizer(max_len=max_selfies_len)
                     if vocab_size is None:
                         vocab_size = len(tokenizer.get_vocab())
-                    print("[WARN] Using dummy tokenizer")
             except Exception as e:
-                print(f"[WARN] Error creating tokenizer: {e}")
                 vocab_size = vocab_size or 1000
         else:
             vocab_size = vocab_size or 1000
@@ -304,7 +303,6 @@ def initialize_global_reward_network(
         # Choose initialization strategy based on environment
         if use_reward_server:
             # For subprocess environments, use reward server
-            print("[INFO] Initializing reward server for subprocess environment...")
             try:
                 start_reward_server(
                     batch_size=batch_size,
@@ -313,18 +311,14 @@ def initialize_global_reward_network(
                     device=device
                 )
                 _global_reward_function = _create_server_reward_function()
-                print("[INFO] Reward server initialization completed")
             except Exception as e:
                 print(f"[WARN] Failed to initialize reward server: {e}, falling back to dummy function")
                 _global_reward_function = _create_dummy_reward_function()
         else:
             # For main process, use direct network initialization
-            print("[INFO] Initializing direct reward network for main process...")
-            
             # Initialize reward network
             if REWARD_NN_AVAILABLE and MoleculeSpectrumMatcher is not None:
                 try:
-                    print(f"[INFO] Creating reward network with max_selfies_len: {max_selfies_len}")
                     _global_reward_network = MoleculeSpectrumMatcher(
                         vocab_size=vocab_size,
                         selfies_embed_dim=selfies_embed_dim,
@@ -341,7 +335,6 @@ def initialize_global_reward_network(
                             _global_reward_network.load_state_dict(checkpoint['model_state_dict'])
                         else:
                             _global_reward_network.load_state_dict(checkpoint)
-                        print(f"[INFO] Loaded reward network from {checkpoint_path}")
                     
                     # Create reward function
                     _global_reward_function = _create_real_reward_function(_global_reward_network, tokenizer, _global_device)
@@ -350,12 +343,9 @@ def initialize_global_reward_network(
                     
                 except Exception as e:
                     print(f"[WARN] Error initializing reward network: {e}")
-                    import traceback
-                    traceback.print_exc()
                     _global_reward_network = None
                     _global_reward_function = _create_dummy_reward_function()
             else:
-                print("[WARN] MoleculeSpectrumMatcher not available, using dummy network")
                 _global_reward_network = None
                 _global_reward_function = _create_dummy_reward_function()
 
@@ -418,10 +408,7 @@ def configure_batched_rewards_for_training(
         'batch_timeout': batch_timeout,
     }
     
-    print(f"[INFO] Configured batched rewards for {num_envs} environments:")
-    print(f"  - Batch size: {batch_size}")
-    print(f"  - Batch timeout: {batch_timeout:.3f}s")
-    print(f"  - Expected throughput improvement: {min(batch_size / 4, 8):.1f}x")
+    # Reduced logging for batched rewards configuration
     
     return config
 
@@ -543,15 +530,33 @@ class RewardServer:
                 requests = []
                 start_time = time.time()
                 
-                # Collect requests until batch is full or timeout
-                while (len(requests) < self.batch_size and 
-                       time.time() - start_time < self.timeout and 
-                       self.running):
+                # First, try to get at least one request (blocking)
+                try:
+                    request = self.request_queue.get(timeout=1.0)  # Wait up to 1s for first request
+                    requests.append(request)
+                except:  # queue.Empty
+                    continue  # No requests, continue loop
+                
+                # Now collect additional requests until batch is full or timeout
+                while len(requests) < self.batch_size and self.running:
+                    remaining_time = self.timeout - (time.time() - start_time)
+                    if remaining_time <= 0:
+                        break  # Timeout reached
+                    
                     try:
-                        request = self.request_queue.get(timeout=0.01)
+                        # Use the remaining time as timeout to avoid waiting too long
+                        timeout = min(remaining_time, 0.01)  # At most 10ms per attempt
+                        request = self.request_queue.get(timeout=timeout)
                         requests.append(request)
-                    except:  # queue.Empty or other queue exceptions
-                        continue
+                    except:  # queue.Empty
+                        # No more requests available immediately
+                        # Check if we should wait a bit more or process what we have
+                        if len(requests) >= self.batch_size // 2:  # Half batch threshold
+                            break  # Process what we have
+                        elif remaining_time > 0.01:
+                            time.sleep(0.001)  # Small sleep to avoid busy waiting
+                        else:
+                            break  # Timeout reached
                 
                 # Process batch if we have any requests
                 if requests and self.running:
@@ -641,7 +646,9 @@ def start_reward_server(
     device: str = None
 ):
     """
-    Start a dedicated reward server process for subprocess-based environments.
+    Start a dedicated reward server with two-process architecture:
+    1. Queue Manager: Handles client requests and response routing
+    2. Reward Processor: Performs batched neural network inference
     
     Args:
         batch_size: Maximum batch size for reward computation
@@ -650,64 +657,174 @@ def start_reward_server(
         device: Device to run the network on
     
     Returns:
-        tuple: (request_queue, response_queue) for communicating with the server
+        tuple: (request_queue, response_dict) for communicating with the server
     """
-    global _reward_server_process, _request_queue, _response_queue, _server_enabled
+    global _reward_processor_process, _queue_manager_process, _request_queue, _response_dict, _processor_request_queue, _processor_response_queue, _server_enabled
+    global _multiprocessing_manager
     
-    if _server_enabled and _reward_server_process is not None:
+    if _server_enabled and _reward_processor_process is not None:
         print("[INFO] Reward server already running")
-        return _request_queue, _response_queue
+        return _request_queue, _response_dict
     
     print(f"[INFO] Starting reward server (batch_size={batch_size}, timeout={timeout}s)")
     
-    # Create multiprocessing queues for communication
+    # Create multiprocessing queues and manager for communication
     ctx = mp.get_context('spawn')  # Use spawn for CUDA compatibility
-    _request_queue = ctx.Queue()
-    _response_queue = ctx.Queue()
+    _multiprocessing_manager = ctx.Manager()
     
-    # Start the server process
-    _reward_server_process = ctx.Process(
-        target=_reward_server_worker,
-        args=(_request_queue, _response_queue, batch_size, timeout, checkpoint_path, device),
+    _request_queue = ctx.Queue()                      # Client -> Queue Manager
+    _response_dict = _multiprocessing_manager.dict()  # Queue Manager -> Client (shared dict)
+    _processor_request_queue = ctx.Queue()             # Queue Manager -> Reward Processor (requests)
+    _processor_response_queue = ctx.Queue()            # Reward Processor -> Queue Manager (responses)
+    
+    # Start the reward processor process (does neural network computation)
+    _reward_processor_process = ctx.Process(
+        target=_reward_processor_worker,
+        args=(_processor_request_queue, _processor_response_queue, batch_size, timeout, checkpoint_path, device),
         daemon=True,
-        name='reward_server'
+        name='reward_processor'
     )
-    _reward_server_process.start()
+    _reward_processor_process.start()
+    
+    # Start the queue manager process (handles request/response routing)
+    _queue_manager_process = ctx.Process(
+        target=_queue_manager_worker,
+        args=(_request_queue, _response_dict, _processor_request_queue, _processor_response_queue),
+        daemon=True,
+        name='queue_manager'
+    )
+    _queue_manager_process.start()
+    
     _server_enabled = True
     
-    print(f"[INFO] Reward server started (PID: {_reward_server_process.pid})")
-    return _request_queue, _response_queue
+    print(f"[INFO] Reward processor started (PID: {_reward_processor_process.pid})")
+    print(f"[INFO] Queue manager started (PID: {_queue_manager_process.pid})")
+    return _request_queue, _response_dict
 
 
-def _reward_server_worker(request_queue, response_queue, batch_size, timeout, checkpoint_path, device):
-    """Worker function that runs the reward server in a separate process"""
+def _queue_manager_worker(request_queue, response_dict, processor_request_queue, processor_response_queue):
+    """Queue manager worker process that routes requests and responses"""
     try:
+        print(f"[INFO] Queue manager started (PID: {os.getpid()})")
+        
+        def signal_handler(signum, frame):
+            print(f"[INFO] Queue manager received signal {signum}, shutting down...")
+            return
+        
+        # Register signal handlers for graceful shutdown
+        import signal
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        # Processing settings
+        processing_interval = 0.01  # Process every 10ms
+        
+        # Monitoring counters (reduced reporting frequency)
+        total_requests = 0
+        total_responses = 0
+        last_report_time = time.time()
+        report_interval = 300.0  # Report stats every 5 minutes instead of 30 seconds
+        
+        while True:
+            try:
+                start_time = time.time()
+                
+                # Process multiple client requests in one cycle
+                requests_processed = 0
+                for _ in range(10):  # Process up to 10 requests per cycle
+                    try:
+                        # Read request from client
+                        client_request = request_queue.get(timeout=0.001)  # Very short timeout
+                        
+                        # Handle different request types
+                        if len(client_request) == 2 and client_request[0].startswith('train_'):
+                            # Training request: (request_id, training_data)
+                            request_id = client_request[0]
+                            processor_request_queue.put(client_request)  # Forward as-is
+                        elif len(client_request) == 4:
+                            # Inference request: (request_id, selfies_string, spectrum_embed, formula_string)
+                            request_id = client_request[0]
+                            processor_request_queue.put(client_request)  # Forward as-is
+                        else:
+                            # Only log warnings, not every request
+                            continue
+                        
+                        requests_processed += 1
+                        
+                    except:  # queue.Empty
+                        break
+                
+                # Process multiple processor responses in one cycle
+                responses_processed = 0
+                for _ in range(10):  # Process up to 10 responses per cycle
+                    try:
+                        # Read response from processor
+                        response = processor_response_queue.get(timeout=0.001)  # Very short timeout
+                        
+                        # Handle both types of responses
+                        if len(response) == 2:
+                            # Both inference and training responses have 2 elements
+                            request_id, result = response
+                            # Store response in shared dictionary by request ID
+                            response_dict[request_id] = result
+                            responses_processed += 1
+                        
+                    except:  # queue.Empty
+                        break
+                
+                # Update counters
+                total_requests += requests_processed
+                total_responses += responses_processed
+                
+                # Periodic monitoring report (much less frequent)
+                current_time = time.time()
+                if current_time - last_report_time >= report_interval:
+                    if total_requests > 0 or total_responses > 0:
+                        print(f"[INFO] Queue manager stats: {total_requests} requests, {total_responses} responses in last {report_interval/60:.1f} minutes")
+                        total_requests = 0
+                        total_responses = 0
+                    last_report_time = current_time
+                
+                # Sleep for the remainder of the processing interval
+                elapsed = time.time() - start_time
+                sleep_time = max(0, processing_interval - elapsed)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                    
+            except Exception as e:
+                print(f"[ERROR] Queue manager error: {e}")
+                time.sleep(processing_interval)
+                
+    except KeyboardInterrupt:
+        print("[INFO] Queue manager interrupted")
+    except Exception as e:
+        print(f"[ERROR] Queue manager worker error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("[INFO] Queue manager shutting down")
+
+
+def _reward_processor_worker(processor_request_queue, processor_response_queue, batch_size, timeout, checkpoint_path, device):
+    """
+    Extended reward processor worker that handles both serving and training requests.
+    This process can switch between inference mode and training mode based on requests.
+    """
+    try:
+        print("[INFO] Reward processor starting with training support...")
+        
         # Set device
         if device is None:
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        device = torch.device(device)
-        
-        # Initialize tokenizer
-        tokenizer = None
-        if TOKENIZERS_AVAILABLE:
-            try:
-                from lzero.model.selfies_tokenizer import SelfiesTokenizer
-                tokenizer = SelfiesTokenizer(max_len=SELFIES_MAX_LEN)
-                print("[INFO] Reward server using real SelfiesTokenizer")
-            except ImportError:
-                tokenizer = DummyTokenizer(max_len=SELFIES_MAX_LEN)
-                print("[INFO] Reward server using dummy tokenizer")
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
-            tokenizer = DummyTokenizer(max_len=SELFIES_MAX_LEN)
-            print("[INFO] Reward server using dummy tokenizer (tokenizers not available)")
+            device = torch.device(device)
         
-        # Initialize reward network
-        network = None
+        # Initialize network and tokenizer
         if REWARD_NN_AVAILABLE and MoleculeSpectrumMatcher is not None:
             try:
-                vocab_size = len(tokenizer.get_vocab()) if tokenizer else 1000
+                # Initialize network
                 network = MoleculeSpectrumMatcher(
-                    vocab_size=vocab_size,
+                    vocab_size=50000,  # Will be updated when tokenizer loads
                     selfies_embed_dim=EMBED_DIM,
                     spectrum_fingerprint_dim=SPECTRUM_DIM,
                     fusion_dim=FUSION_DIM,
@@ -718,46 +835,508 @@ def _reward_server_worker(request_queue, response_queue, batch_size, timeout, ch
                 # Load checkpoint if provided
                 if checkpoint_path and os.path.exists(checkpoint_path):
                     checkpoint = torch.load(checkpoint_path, map_location=device)
-                    if 'model_state_dict' in checkpoint:
-                        network.load_state_dict(checkpoint['model_state_dict'])
-                    else:
-                        network.load_state_dict(checkpoint)
-                    print(f"[INFO] Reward server loaded checkpoint from {checkpoint_path}")
+                    network.load_state_dict(checkpoint, strict=False)
                 
-                print(f"[INFO] Reward server initialized network on {device}")
+                # Initialize tokenizer
+                if TOKENIZERS_AVAILABLE:
+                    from main.LightZero.lzero.model.selfies_tokenizer import SelfiesTokenizer
+                    tokenizer = SelfiesTokenizer(max_len=MAX_LEN)
+                    # Update network vocab size if needed
+                    if hasattr(network, 'update_vocab_size'):
+                        network.update_vocab_size(len(tokenizer.get_vocab()))
+                else:
+                    tokenizer = DummyTokenizer(max_len=MAX_LEN)
                 
             except Exception as e:
-                print(f"[WARN] Reward server failed to initialize network: {e}")
+                print(f"[ERROR] Failed to initialize reward network: {e}")
                 network = None
+                tokenizer = DummyTokenizer(max_len=MAX_LEN)
         else:
-            print("[WARN] Reward server using dummy network (MoleculeSpectrumMatcher not available)")
+            network = None
+            tokenizer = DummyTokenizer(max_len=MAX_LEN)
         
-        # Create and start the server
-        server = RewardServer(network, tokenizer, device, batch_size, timeout)
-        server.start_server(request_queue, response_queue)
+        # Create the enhanced processor with training capabilities
+        processor = EnhancedRewardProcessor(network, tokenizer, device, batch_size, timeout)
+        processor.start_processing(processor_request_queue, processor_response_queue)
         
     except Exception as e:
-        print(f"[ERROR] Reward server worker error: {e}")
+        print(f"[ERROR] Reward processor worker error: {e}")
         import traceback
         traceback.print_exc()
 
 
-def stop_reward_server():
-    """Stop the reward server process"""
-    global _reward_server_process, _server_enabled, _request_queue, _response_queue
+class EnhancedRewardProcessor:
+    """
+    Enhanced reward processor that handles both inference and training requests.
+    Supports switching between serving mode and training mode based on request types.
+    """
     
-    if _reward_server_process is not None:
-        print("[INFO] Stopping reward server...")
-        _reward_server_process.terminate()
-        _reward_server_process.join(timeout=5)
-        if _reward_server_process.is_alive():
-            print("[WARN] Reward server did not stop gracefully, killing...")
-            _reward_server_process.kill()
-        _reward_server_process = None
-        _server_enabled = False
-        _request_queue = None
-        _response_queue = None
-        print("[INFO] Reward server stopped")
+    def __init__(self, network, tokenizer, device, batch_size=32, timeout=0.1):
+        self.network = network
+        self.tokenizer = tokenizer
+        self.device = device
+        self.batch_size = batch_size
+        self.timeout = timeout
+        self.running = False
+        
+        # Training-related attributes
+        self.optimizer = None
+        self.training_enabled = False
+        self.current_mode = "serving"  # "serving" or "training"
+        
+        # Initialize optimizer if network is available
+        if self.network is not None:
+            self._initialize_optimizer()
+        
+    def _initialize_optimizer(self):
+        """Initialize optimizer for reward network training"""
+        try:
+            # Default training configuration - can be updated via training requests
+            learning_rate = 1e-4
+            weight_decay = 1e-4
+            
+            self.optimizer = torch.optim.Adam(
+                self.network.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay
+            )
+            
+            self.training_enabled = True
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize optimizer: {e}")
+            self.optimizer = None
+            self.training_enabled = False
+    
+    def start_processing(self, processor_request_queue, processor_response_queue):
+        """Start the enhanced processor main loop with training support"""
+        self.processor_request_queue = processor_request_queue
+        self.processor_response_queue = processor_response_queue
+        self.running = True
+        
+        # Set up signal handler for graceful shutdown
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        
+        try:
+            self._processor_loop()
+        except KeyboardInterrupt:
+            print("[INFO] Enhanced reward processor interrupted")
+        except Exception as e:
+            print(f"[ERROR] Enhanced reward processor error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            print("[INFO] Enhanced reward processor shutting down")
+            self.running = False
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        print(f"[INFO] Enhanced reward processor received signal {signum}, shutting down...")
+        self.running = False
+    
+    def _processor_loop(self):
+        """Enhanced main processing loop with both inference and training support"""
+        processing_interval = 0.01  # Process every 10ms
+        
+        # Monitoring counters (reduced reporting frequency)
+        total_inference_batches = 0
+        total_training_batches = 0
+        total_inference_requests = 0
+        total_training_requests = 0
+        last_report_time = time.time()
+        report_interval = 300.0  # Report stats every 5 minutes instead of 30 seconds
+        
+        print(f"[INFO] Enhanced reward processor loop started with training support")
+        
+        while self.running:
+            try:
+                start_time = time.time()
+                
+                # Collect all available requests (up to batch_size) without blocking
+                inference_requests = []
+                training_requests = []
+                
+                for _ in range(self.batch_size * 2):  # Allow more requests since we have two types
+                    try:
+                        request_data = self.processor_request_queue.get(timeout=0.001)  # Very short timeout
+                        
+                        # Classify request type based on the structure
+                        if len(request_data) == 2 and request_data[0].startswith('train_'):
+                            # Training request: ('train_REQUEST_ID', training_data_dict)
+                            training_requests.append(request_data)
+                        elif len(request_data) == 4:
+                            # Inference request: (request_id, selfies, spectrum_embed, formula)
+                            inference_requests.append(request_data)
+                            
+                    except:  # queue.Empty
+                        break  # No more requests available immediately
+                
+                # Process inference requests (serving mode)
+                if inference_requests:
+                    self.current_mode = "serving"
+                    try:
+                        self._process_inference_batch(inference_requests)
+                        total_inference_batches += 1
+                        total_inference_requests += len(inference_requests)
+                    except Exception as e:
+                        print(f"[ERROR] Enhanced reward processor failed to process inference batch: {e}")
+                        # Send dummy responses for failed batch
+                        for request_id, _, _, _ in inference_requests:
+                            self.processor_response_queue.put((request_id, 0.0))
+                
+                # Process training requests (training mode)
+                if training_requests and self.training_enabled:
+                    self.current_mode = "training"
+                    try:
+                        self._process_training_batch(training_requests)
+                        total_training_batches += 1
+                        total_training_requests += len(training_requests)
+                    except Exception as e:
+                        print(f"[ERROR] Enhanced reward processor failed to process training batch: {e}")
+                        # Send error responses for failed training batch
+                        for request_id, _ in training_requests:
+                            self.processor_response_queue.put((request_id, {
+                                'status': 'error',
+                                'message': str(e)
+                            }))
+                
+                # Periodic monitoring report (much less frequent)
+                current_time = time.time()
+                if current_time - last_report_time >= report_interval:
+                    total_batches = total_inference_batches + total_training_batches
+                    total_requests = total_inference_requests + total_training_requests
+                    
+                    if total_batches > 0:
+                        avg_batch_size = total_requests / total_batches if total_batches > 0 else 0
+                        print(f"[INFO] Enhanced reward processor stats: "
+                              f"Inference: {total_inference_batches} batches ({total_inference_requests} requests), "
+                              f"Training: {total_training_batches} batches ({total_training_requests} requests), "
+                              f"avg batch size: {avg_batch_size:.1f} in last {report_interval/60:.1f} minutes")
+                    
+                    # Reset counters
+                    total_inference_batches = 0
+                    total_training_batches = 0
+                    total_inference_requests = 0
+                    total_training_requests = 0
+                    last_report_time = current_time
+                
+                # Sleep for the remainder of the processing interval
+                elapsed = time.time() - start_time
+                sleep_time = max(0, processing_interval - elapsed)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                    
+            except Exception as e:
+                print(f"[ERROR] Error in enhanced reward processor loop: {e}")
+                time.sleep(processing_interval)  # Still maintain the interval on error
+    
+    def _process_inference_batch(self, requests):
+        """Process a batch of reward computation requests (inference mode)"""
+        try:
+            if self.network is None:
+                # Return dummy rewards
+                for request_id, _, _, _ in requests:
+                    self.processor_response_queue.put((request_id, 0.0))
+                return
+            
+            # Extract data from requests
+            request_ids = [req[0] for req in requests]
+            selfies_strings = [req[1] for req in requests]
+            spectrum_embeds = [req[2] for req in requests]
+            formula_strings = [req[3] for req in requests]
+            
+            # Perform batched neural network inference
+            rewards = self._compute_batch_rewards(selfies_strings, spectrum_embeds)
+            
+            # Send results back via response queue
+            for request_id, reward in zip(request_ids, rewards):
+                self.processor_response_queue.put((request_id, reward))
+                
+        except Exception as e:
+            print(f"[ERROR] Error processing inference batch: {e}")
+            # Return dummy rewards for failed batch
+            for request_id, _, _, _ in requests:
+                self.processor_response_queue.put((request_id, 0.0))
+    
+    def _process_training_batch(self, requests):
+        """Process a batch of training requests (training mode)"""
+        if self.network is None or self.optimizer is None:
+            # Send error responses
+            for request_id, _ in requests:
+                self.processor_response_queue.put((request_id, {
+                    'status': 'error', 
+                    'message': 'Network or optimizer not available'
+                }))
+            return
+        
+        try:
+            # Only log training batches occasionally to reduce noise
+            if len(requests) > 5:  # Only log larger training batches
+                print(f"[INFO] Processing training batch with {len(requests)} requests")
+            
+            # Process each training request
+            for request_id, training_data in requests:
+                try:
+                    result = self._train_on_gag_data(training_data)
+                    self.processor_response_queue.put((request_id, result))
+                except Exception as e:
+                    print(f"[ERROR] Error training on request {request_id}: {e}")
+                    self.processor_response_queue.put((request_id, {
+                        'status': 'error',
+                        'message': str(e)
+                    }))
+                    
+        except Exception as e:
+            print(f"[ERROR] Error processing training batch: {e}")
+            # Send error responses for failed batch
+            for request_id, _ in requests:
+                self.processor_response_queue.put((request_id, {
+                    'status': 'error',
+                    'message': str(e)
+                }))
+    
+    def _train_on_gag_data(self, training_data):
+        """
+        Train the reward network on GAG (Generated vs Ground-truth Adversarial) data
+        
+        Args:
+            training_data: Dictionary containing:
+                - generated_selfies: List of generated SELFIES strings
+                - ground_truth_selfies: List of ground-truth SELFIES strings  
+                - spectrum_embeds: List of spectrum embeddings
+                - learning_rate: Optional learning rate override
+                - weight_decay: Optional weight decay override
+        
+        Returns:
+            Training results dictionary
+        """
+        try:
+            self.network.train()
+            
+            # Extract training data
+            generated_selfies = training_data.get('generated_selfies', [])
+            ground_truth_selfies = training_data.get('ground_truth_selfies', [])
+            spectrum_embeds = training_data.get('spectrum_embeds', [])
+            
+            # Optional hyperparameter overrides
+            lr_override = training_data.get('learning_rate', None)
+            wd_override = training_data.get('weight_decay', None)
+            
+            if not generated_selfies or not ground_truth_selfies or not spectrum_embeds:
+                return {'status': 'error', 'message': 'Empty training data'}
+            
+            if len(generated_selfies) != len(ground_truth_selfies) or len(generated_selfies) != len(spectrum_embeds):
+                return {'status': 'error', 'message': 'Mismatched training data lengths'}
+            
+            # Update optimizer if hyperparameters changed
+            if lr_override is not None or wd_override is not None:
+                self._update_optimizer_params(lr_override, wd_override)
+            
+            # Zero gradients
+            self.optimizer.zero_grad()
+            
+            # Compute rewards for generated and ground-truth SELFIES
+            # These should already be tensors with gradients from _compute_batch_rewards
+            generated_rewards = self._compute_batch_rewards_with_grad(generated_selfies, spectrum_embeds)
+            ground_truth_rewards = self._compute_batch_rewards_with_grad(ground_truth_selfies, spectrum_embeds)
+            
+            # Ensure tensors are on correct device
+            generated_rewards_tensor = generated_rewards.to(self.device)
+            ground_truth_rewards_tensor = ground_truth_rewards.to(self.device)
+            
+            # Compute GAG losses - focus only on preference loss to avoid conflicting objectives
+            preference_loss = self._compute_preference_loss(generated_rewards_tensor, ground_truth_rewards_tensor)
+            
+            # Total loss (only preference loss to ensure GT > Generated)
+            total_loss = preference_loss
+            
+            # Backward pass
+            total_loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+            
+            # Optimizer step
+            self.optimizer.step()
+            
+            # Return training results
+            return {
+                'status': 'success',
+                'preference_loss': float(preference_loss.item()),
+                'total_loss': float(total_loss.item()),
+                'mean_generated_reward': float(torch.mean(generated_rewards_tensor).item()),
+                'mean_ground_truth_reward': float(torch.mean(ground_truth_rewards_tensor).item()),
+                'num_pairs': len(generated_selfies),
+                'learning_rate': self.optimizer.param_groups[0]['lr'],
+                'weight_decay': self.optimizer.param_groups[0]['weight_decay']
+            }
+            
+        except Exception as e:
+            print(f"[ERROR] Error in _train_on_gag_data: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'status': 'error', 'message': str(e)}
+    
+    def _update_optimizer_params(self, learning_rate=None, weight_decay=None):
+        """Update optimizer parameters"""
+        if learning_rate is not None:
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = learning_rate
+        
+        if weight_decay is not None:
+            for param_group in self.optimizer.param_groups:
+                param_group['weight_decay'] = weight_decay
+    
+    def _compute_adversarial_loss(self, generated_rewards, ground_truth_rewards):
+        """Compute adversarial loss (encourage ground-truth rewards to be high)"""
+        return -torch.mean(ground_truth_rewards)
+    
+    def _compute_preference_loss(self, generated_rewards, ground_truth_rewards):
+        """Compute preference loss (encourage ground-truth to be preferred over generated)"""
+        # Simple ranking loss: minimize (generated - ground_truth) to make GT > Generated
+        ranking_loss = torch.mean(torch.relu(generated_rewards - ground_truth_rewards + 0.1))  # 0.1 margin
+        return ranking_loss
+    
+    def _compute_batch_rewards(self, selfies_strings, spectrum_embeds):
+        """Compute rewards for a batch of SELFIES and spectrum embeddings (same as original)"""
+        # Enable gradients only during training mode
+        ctx = torch.enable_grad() if self.current_mode == "training" else torch.no_grad()
+        with ctx:
+            # Batch encode SELFIES
+            selfies_tensors = []
+            selfies_masks = []
+            
+            for selfies_string in selfies_strings:
+                if self.tokenizer is not None:
+                    if hasattr(self.tokenizer, 'encode_selfies'):
+                        # Real SelfiesTokenizer
+                        selfies_tokens = self.tokenizer.encode_selfies(selfies_string, add_special_tokens=True)
+                        selfies_tensor = torch.tensor(selfies_tokens, dtype=torch.long).to(self.device)
+                        selfies_mask = (selfies_tensor != self.tokenizer.pad_token_id).to(self.device)
+                    else:
+                        # Fallback
+                        selfies_tensor = torch.zeros(MAX_LEN, dtype=torch.long).to(self.device)
+                        selfies_mask = torch.ones(MAX_LEN, dtype=torch.bool).to(self.device)
+                else:
+                    # Dummy implementation
+                    selfies_tensor = torch.zeros(MAX_LEN, dtype=torch.long).to(self.device)
+                    selfies_mask = torch.ones(MAX_LEN, dtype=torch.bool).to(self.device)
+                
+                selfies_tensors.append(selfies_tensor)
+                selfies_masks.append(selfies_mask)
+            
+            # Stack into batch tensors
+            batch_selfies = torch.stack(selfies_tensors)  # [batch_size, max_len]
+            batch_masks = torch.stack(selfies_masks)      # [batch_size, max_len]
+            
+            # Stack spectrum embeddings
+            batch_spectrums = torch.stack([embed.to(self.device) for embed in spectrum_embeds])  # [batch_size, 4096]
+            
+            # Encode SELFIES using the network's SELFIES encoder
+            molecule_embeds = self.network.selfies_encoder(batch_selfies, batch_masks)
+            molecule_embeds = self.network.molecule_projection(molecule_embeds)
+            
+            # Project spectrum embeddings to fusion space
+            spectrum_embeds_proj = self.network.fingerprint_projection(batch_spectrums)
+            
+            # Normalize embeddings
+            molecule_embeds = F.normalize(molecule_embeds, p=2, dim=-1)
+            spectrum_embeds_proj = F.normalize(spectrum_embeds_proj, p=2, dim=-1)
+            
+            # Compute similarities
+            similarities = torch.sum(molecule_embeds * spectrum_embeds_proj, dim=1)
+            similarities = similarities / self.network.temperature
+            
+            return [float(sim.item()) for sim in similarities]
+    
+    def _compute_batch_rewards_with_grad(self, selfies_strings, spectrum_embeds):
+        """Compute rewards for training (returns tensor with gradients)"""
+        # Batch encode SELFIES
+        selfies_tensors = []
+        selfies_masks = []
+        
+        for selfies_string in selfies_strings:
+            if self.tokenizer is not None:
+                if hasattr(self.tokenizer, 'encode_selfies'):
+                    # Real SelfiesTokenizer
+                    selfies_tokens = self.tokenizer.encode_selfies(selfies_string, add_special_tokens=True)
+                    selfies_tensor = torch.tensor(selfies_tokens, dtype=torch.long).to(self.device)
+                    selfies_mask = (selfies_tensor != self.tokenizer.pad_token_id).to(self.device)
+                else:
+                    # Fallback
+                    selfies_tensor = torch.zeros(MAX_LEN, dtype=torch.long).to(self.device)
+                    selfies_mask = torch.ones(MAX_LEN, dtype=torch.bool).to(self.device)
+            else:
+                # Dummy implementation
+                selfies_tensor = torch.zeros(MAX_LEN, dtype=torch.long).to(self.device)
+                selfies_mask = torch.ones(MAX_LEN, dtype=torch.bool).to(self.device)
+            
+            selfies_tensors.append(selfies_tensor)
+            selfies_masks.append(selfies_mask)
+        
+        # Stack into batch tensors
+        batch_selfies = torch.stack(selfies_tensors)  # [batch_size, max_len]
+        batch_masks = torch.stack(selfies_masks)      # [batch_size, max_len]
+        
+        # Stack spectrum embeddings
+        batch_spectrums = torch.stack([embed.to(self.device) for embed in spectrum_embeds])  # [batch_size, 4096]
+        
+        # Encode SELFIES using the network's SELFIES encoder
+        molecule_embeds = self.network.selfies_encoder(batch_selfies, batch_masks)
+        molecule_embeds = self.network.molecule_projection(molecule_embeds)
+        
+        # Project spectrum embeddings to fusion space
+        spectrum_embeds_proj = self.network.fingerprint_projection(batch_spectrums)
+        
+        # Normalize embeddings
+        molecule_embeds = F.normalize(molecule_embeds, p=2, dim=-1)
+        spectrum_embeds_proj = F.normalize(spectrum_embeds_proj, p=2, dim=-1)
+        
+        # Compute similarities
+        similarities = torch.sum(molecule_embeds * spectrum_embeds_proj, dim=1)
+        similarities = similarities / self.network.temperature
+        
+        return similarities  # Return tensor with gradients
+
+
+def stop_reward_server():
+    """Stop the reward server processes"""
+    global _reward_processor_process, _queue_manager_process, _server_enabled, _request_queue, _response_dict, _processor_request_queue, _processor_response_queue
+    global _multiprocessing_manager
+    
+    if _reward_processor_process is not None:
+        print("[INFO] Stopping reward processor...")
+        _reward_processor_process.terminate()
+        _reward_processor_process.join(timeout=5)
+        if _reward_processor_process.is_alive():
+            print("[WARN] Reward processor did not stop gracefully, killing...")
+            _reward_processor_process.kill()
+        _reward_processor_process = None
+    
+    if _queue_manager_process is not None:
+        print("[INFO] Stopping queue manager...")
+        _queue_manager_process.terminate()
+        _queue_manager_process.join(timeout=5)
+        if _queue_manager_process.is_alive():
+            print("[WARN] Queue manager did not stop gracefully, killing...")
+            _queue_manager_process.kill()
+        _queue_manager_process = None
+    
+    # Clean up manager resources
+    if _multiprocessing_manager is not None:
+        try:
+            _multiprocessing_manager.shutdown()
+        except:
+            pass
+        _multiprocessing_manager = None
+    
+    _server_enabled = False
+    _request_queue = None
+    _response_dict = None
+    _processor_request_queue = None
+    _processor_response_queue = None
+    print("[INFO] Reward server stopped")
 
 
 def _create_server_reward_function():
@@ -778,9 +1357,9 @@ def _create_server_reward_function():
         Returns:
             Similarity score as reward
         """
-        global _request_queue, _response_queue, _server_enabled
+        global _request_queue, _response_dict, _server_enabled, _client_timeout
         
-        if not _server_enabled or _request_queue is None or _response_queue is None:
+        if not _server_enabled or _request_queue is None or _response_dict is None:
             print("[WARN] Reward server not available, returning dummy reward")
             return 0.0
         
@@ -790,34 +1369,48 @@ def _create_server_reward_function():
             
             # Send request to server
             request = (request_id, selfies_string, spectrum_embed.cpu(), formula_string)
-            _request_queue.put(request, timeout=1.0)
+            _request_queue.put(request, timeout=_client_timeout)
             
-            # Wait for response
+            # Wait for response by polling the shared dictionary with adaptive intervals
             start_time = time.time()
-            while time.time() - start_time < 5.0:  # 5 second timeout
-                try:
-                    response_id, reward = _response_queue.get(timeout=0.1)
-                    if response_id == request_id:
-                        return reward
-                    else:
-                        # Put back response for another request
-                        _response_queue.put((response_id, reward))
-                except:  # queue.Empty
-                    continue
+            check_interval = 0.001  # Start with 1ms checks
+            max_interval = 0.01     # Maximum 10ms between checks
             
-            print(f"[WARN] Timeout waiting for reward server response for request {request_id}")
+            while time.time() - start_time < _client_timeout:
+                if request_id in _response_dict:
+                    reward = _response_dict[request_id]
+                    # Clean up the response from the dict
+                    del _response_dict[request_id]
+                    return reward
+                
+                # Adaptive polling - start fast, then slow down slightly
+                time.sleep(check_interval)
+                check_interval = min(max_interval, check_interval * 1.1)
+            
+            # Timeout
+            print(f"[WARN] Timeout waiting for reward server response for request {request_id} (timeout: {_client_timeout:.3f}s)")
+            # Try to clean up the request if it somehow got processed after timeout
+            _response_dict.pop(request_id, None)
             return 0.0
             
         except Exception as e:
             print(f"[WARN] Error communicating with reward server: {e}")
+            import traceback
+            traceback.print_exc()
             return 0.0
     
     return server_reward_fn
 
 
+def get_client_timeout() -> float:
+    """Get the current client timeout for reward server communication"""
+    global _client_timeout
+    return _client_timeout
+
+
 def is_reward_server_enabled() -> bool:
     """Check if the reward server is enabled and running (subprocess-safe)"""
-    global _server_enabled, _reward_server_process
+    global _server_enabled, _reward_processor_process, _queue_manager_process
     
     # In subprocess environments, we can't safely call is_alive() on a process
     # created in the parent process. Instead, we rely on the _server_enabled flag
@@ -827,7 +1420,82 @@ def is_reward_server_enabled() -> bool:
     
     if current_process.name != 'MainProcess':
         # We're in a subprocess - only check the flag and queue availability
-        return _server_enabled and _request_queue is not None and _response_queue is not None
+        return _server_enabled and _request_queue is not None and _response_dict is not None
     else:
         # We're in the main process - safe to check process status
-        return _server_enabled and _reward_server_process is not None and _reward_server_process.is_alive() 
+        return (_server_enabled and 
+                _reward_processor_process is not None and _reward_processor_process.is_alive() and
+                _queue_manager_process is not None and _queue_manager_process.is_alive())
+
+
+# Helper function to send training data to reward server
+def send_training_data_to_server(
+    generated_selfies: List[str],
+    ground_truth_selfies: List[str], 
+    spectrum_embeds: List[torch.Tensor],
+    learning_rate: float = None,
+    weight_decay: float = None,
+    timeout: float = 10.0
+) -> Dict[str, Any]:
+    """
+    Send training data to the reward server for network training
+    
+    Args:
+        generated_selfies: List of generated SELFIES strings
+        ground_truth_selfies: List of ground-truth SELFIES strings
+        spectrum_embeds: List of spectrum embeddings
+        learning_rate: Optional learning rate override
+        weight_decay: Optional weight decay override  
+        timeout: Timeout for server communication
+        
+    Returns:
+        Training results dictionary
+    """
+    global _request_queue, _response_dict, _server_enabled
+    
+    if not _server_enabled or _request_queue is None or _response_dict is None:
+        return {'status': 'error', 'message': 'Reward server not available'}
+    
+    try:
+        # Generate unique training request ID
+        request_id = f"train_{str(uuid.uuid4())}"
+        
+        # Prepare training data
+        training_data = {
+            'generated_selfies': generated_selfies,
+            'ground_truth_selfies': ground_truth_selfies,
+            'spectrum_embeds': [embed.cpu() for embed in spectrum_embeds],  # Move to CPU for serialization
+        }
+        
+        if learning_rate is not None:
+            training_data['learning_rate'] = learning_rate
+        if weight_decay is not None:
+            training_data['weight_decay'] = weight_decay
+        
+        # Send training request to server
+        request = (request_id, training_data)
+        _request_queue.put(request, timeout=timeout)
+        
+        # Wait for training response
+        start_time = time.time()
+        check_interval = 0.01  # Check every 10ms for training responses
+        
+        while time.time() - start_time < timeout:
+            if request_id in _response_dict:
+                result = _response_dict[request_id]
+                # Clean up the response from the dict
+                del _response_dict[request_id]
+                return result
+            
+            time.sleep(check_interval)
+        
+        # Timeout
+        print(f"[WARN] Timeout waiting for training response from reward server (timeout: {timeout:.1f}s)")
+        _response_dict.pop(request_id, None)
+        return {'status': 'error', 'message': 'Server timeout'}
+        
+    except Exception as e:
+        print(f"[ERROR] Error sending training data to reward server: {e}")
+        import traceback
+        traceback.print_exc()
+        return {'status': 'error', 'message': str(e)} 

@@ -355,7 +355,7 @@ class MassSelfiesED(nn.Module):
         # mask special tokens
         for sid in [self.pad_token_id, self.sos_token_id,
                     self.eos_token_id, self.unk_token_id]:
-            full_logits[:, sid] = float('-1e9')
+            full_logits[:, sid] = float('-1e3')
 
         # slice to environment action space (71)
         policy_logits = full_logits[:, self.action_token_ids]  # (B,71)
@@ -516,9 +516,18 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
     def __init__(self, observation_shape=4246, max_len=100,
                  d_model=512, n_enc=4, n_dec=6, n_head=8,
                  dropout=0.1, device='cuda', target_formula=None,  # Deprecated: formula extracted from observations
-                 formula_max_len=50, **kwargs):
+                 formula_max_len=50, pretrained_transformer_path=None, 
+                 # Intelligent END token masking parameters
+                 prevent_early_termination=True,
+                 min_formula_completion=0.8,
+                 allow_early_end_after_steps=20,
+                 **kwargs):
         super().__init__(observation_shape, max_len, d_model, n_enc, n_dec, 
                         n_head, dropout, device, **kwargs)
+        
+        # Load pretrained transformer weights if path is provided
+        if pretrained_transformer_path is not None:
+            self._load_pretrained_transformer(pretrained_transformer_path)
         
         # Note: target_formula is now extracted dynamically from observations
         
@@ -564,6 +573,120 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                            not any(special in token for special in ['Ring', 'Branch'])]
         self.bonded_atom_tokens = []  # Can be extended if needed
         
+        # Store configuration
+        self.formula_max_len = formula_max_len
+        self.pretrained_transformer_path = pretrained_transformer_path
+        
+        # Intelligent END token masking configuration
+        self.prevent_early_termination = prevent_early_termination
+        self.min_formula_completion = min_formula_completion
+        self.allow_early_end_after_steps = allow_early_end_after_steps
+        
+    def _load_pretrained_transformer(self, pretrained_path: str):
+        """
+        Load pretrained weights into the self.transformer (MassSelfiesED) component.
+        
+        Args:
+            pretrained_path (str): Path to the pretrained model checkpoint
+        """
+        try:
+            print(f"[INFO] Loading pretrained transformer from: {pretrained_path}")
+            
+            # Handle module compatibility for checkpoints saved with different module paths
+            import sys
+            
+            # Create module alias for compatibility with checkpoints that reference 'pretrain_transformer'
+            if 'pretrain_transformer' not in sys.modules:
+                try:
+                    from lzero.model import pretrain_transformer
+                    sys.modules['pretrain_transformer'] = pretrain_transformer
+                except ImportError:
+                    # If the import fails, create a minimal compatibility module
+                    import types
+                    compat_module = types.ModuleType('pretrain_transformer')
+                    from lzero.model.pretrain_transformer import PretrainConfig
+                    compat_module.PretrainConfig = PretrainConfig
+                    sys.modules['pretrain_transformer'] = compat_module
+            
+            # Load the checkpoint with weights_only=False for PyTorch 2.6 compatibility
+            # This is safe since we trust the source of our pretrained models
+            try:
+                checkpoint = torch.load(pretrained_path, map_location=self.device, weights_only=False)
+            except TypeError:
+                # Fallback for older PyTorch versions that don't have weights_only parameter
+                checkpoint = torch.load(pretrained_path, map_location=self.device)
+            
+            # Extract model state dict from checkpoint
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+                print("[INFO] Found 'model_state_dict' in checkpoint")
+            elif 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+                print("[INFO] Found 'state_dict' in checkpoint")
+            else:
+                # Assume the checkpoint is the state dict itself
+                state_dict = checkpoint
+                print("[INFO] Using checkpoint as state dict directly")
+            
+            # Handle shape mismatches, particularly for positional embeddings
+            current_state = self.transformer.state_dict()
+            adjusted_state_dict = {}
+            
+            for key, value in state_dict.items():
+                if key in current_state:
+                    current_shape = current_state[key].shape
+                    checkpoint_shape = value.shape
+                    
+                    if current_shape != checkpoint_shape:
+                        print(f"[INFO] Shape mismatch for {key}: checkpoint {checkpoint_shape} vs current {current_shape}")
+                        
+                        if key == 'pos_embed.weight' and len(current_shape) == 2 and len(checkpoint_shape) == 2:
+                            # Handle positional embedding size mismatch
+                            max_len_current = current_shape[0]
+                            max_len_checkpoint = checkpoint_shape[0]
+                            
+                            if max_len_checkpoint > max_len_current:
+                                # Truncate if checkpoint has larger max_len
+                                adjusted_value = value[:max_len_current, :]
+                                print(f"[INFO] Truncated {key} from {checkpoint_shape} to {adjusted_value.shape}")
+                            elif max_len_checkpoint < max_len_current:
+                                # Pad with zeros if checkpoint has smaller max_len
+                                padding_size = max_len_current - max_len_checkpoint
+                                padding = torch.zeros(padding_size, value.shape[1], device=value.device, dtype=value.dtype)
+                                adjusted_value = torch.cat([value, padding], dim=0)
+                                print(f"[INFO] Padded {key} from {checkpoint_shape} to {adjusted_value.shape}")
+                            else:
+                                adjusted_value = value
+                                
+                            adjusted_state_dict[key] = adjusted_value
+                        else:
+                            # For other mismatches, skip loading this parameter
+                            print(f"[WARN] Skipping {key} due to incompatible shape mismatch")
+                            continue
+                    else:
+                        adjusted_state_dict[key] = value
+                else:
+                    # Key not in current model, skip
+                    print(f"[WARN] Key {key} not found in current model, skipping")
+            
+            # Load the adjusted state dict into the transformer
+            missing_keys, unexpected_keys = self.transformer.load_state_dict(adjusted_state_dict, strict=False)
+            
+            if missing_keys:
+                print(f"[WARN] Missing keys when loading pretrained transformer: {missing_keys}")
+            if unexpected_keys:
+                print(f"[WARN] Unexpected keys when loading pretrained transformer: {unexpected_keys}")
+            
+            print(f"[INFO] Successfully loaded pretrained transformer weights!")
+            print(f"[INFO] Transformer parameters: {sum(p.numel() for p in self.transformer.parameters()):,}")
+            print(f"[INFO] Trainable parameters: {sum(p.numel() for p in self.transformer.parameters() if p.requires_grad):,}")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to load pretrained transformer from {pretrained_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            print("[WARN] Continuing with randomly initialized transformer weights")
+            
     def set_target_formula(self, formula: str):
         """Deprecated: target formula is now extracted dynamically from observations"""
         print(f"[WARN] set_target_formula is deprecated. Formula is now extracted from observations automatically.")
@@ -678,7 +801,9 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                     formula_masking=True,
                     end_token="<END>",
                     remove_token="<REMOVE>",
-                    special_tokens=[]
+                    special_tokens=[],
+                    min_formula_completion=self.min_formula_completion if self.prevent_early_termination else 0.0,
+                    allow_early_end_after_steps=self.allow_early_end_after_steps if self.prevent_early_termination else 0
                 )
                 # available actions
                 # available_actions = [actions_list[i] for i in range(len(actions_list)) if action_mask[i]]
@@ -729,7 +854,9 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                     formula_masking=True,
                     end_token="<END>",
                     remove_token="<REMOVE>",
-                    special_tokens=[]
+                    special_tokens=[],
+                    min_formula_completion=self.min_formula_completion if self.prevent_early_termination else 0.0,
+                    allow_early_end_after_steps=self.allow_early_end_after_steps if self.prevent_early_termination else 0
                 )
                 
                 # Check if only END token is available
@@ -825,8 +952,12 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         
         mask = (selfies_ids_clamped != self.tok.pad_token_id) & (selfies_ids_clamped != self.tok.end_token_id)
 
+        assert not torch.isnan(spectrum).any(), f"spectrum has nan: {spectrum}"
+        assert not torch.isnan(selfies_ids_clamped).any(), f"selfies_ids_clamped has nan: {selfies_ids_clamped}"
+        assert not torch.isnan(mask).any(), f"mask has nan: {mask}"
         logits, value = self.transformer(spectrum, selfies_ids_clamped, mask)
-        
+        assert not torch.isnan(logits).any(), f"logits has nan: {logits}"
+
         # Apply formula-based action masking
         masked_logits = self._apply_formula_mask(logits, current_selfies_list, formula_list)
         value = value.unsqueeze(-1)

@@ -176,7 +176,9 @@ def get_action_mask(
     formula_masking: bool = True,
     end_token: str = "<END>",
     remove_token: str = "<REMOVE>",
-    special_tokens: List[str] = None
+    special_tokens: List[str] = None,
+    min_formula_completion: float = 0.8,  # Minimum completion ratio before END is allowed
+    allow_early_end_after_steps: int = 20  # Allow END after this many steps even if incomplete
 ) -> np.ndarray:
     """
     Generate a boolean mask over the action space indicating which actions are valid.
@@ -192,6 +194,8 @@ def get_action_mask(
         end_token (str): End token identifier
         remove_token (str): Remove token identifier
         special_tokens (List[str]): List of special tokens to mask out
+        min_formula_completion (float): Minimum completion ratio before END token is allowed
+        allow_early_end_after_steps (int): Allow END token after this many steps even if incomplete
         
     Returns:
         np.ndarray: Boolean mask array
@@ -228,10 +232,32 @@ def get_action_mask(
         # fallback: allow all
         mask[:] = True
     
-    # End token is always allowed
+    # Intelligent END token masking to prevent early termination
     if end_token in actions_list:
         idx = actions_list.index(end_token)
-        mask[idx] = True
+        
+        # Calculate formula completion ratio
+        formula_completion = 0.0
+        if formula_masking and formula:
+            try:
+                formula_completion = calculate_formula_completion_reward(formula, used_element_counts)
+            except:
+                formula_completion = 0.0
+        
+        # Calculate number of steps taken (approximated by used atom count)
+        total_used_atoms = sum(used_element_counts.values()) if used_element_counts else 0
+        
+        # Allow END token only if:
+        # 1. Formula completion is high enough, OR
+        # 2. We've taken many steps (prevents infinite episodes), OR
+        # 3. Formula masking is disabled
+        if (formula_completion >= min_formula_completion or 
+            total_used_atoms >= allow_early_end_after_steps or 
+            not formula_masking or 
+            not formula):
+            mask[idx] = True
+        else:
+            mask[idx] = False  # Mask out END token to prevent early termination
     
     # Remove token not allowed if no current molecule
     if not current_selfies and remove_token in actions_list:
@@ -478,7 +504,9 @@ def get_action_mask_from_selfies_string(
     formula_masking: bool = True,
     end_token: str = "<END>",
     remove_token: str = "<REMOVE>",
-    special_tokens: List[str] = None
+    special_tokens: List[str] = None,
+    min_formula_completion: float = 0.8,  # Minimum completion ratio before END is allowed
+    allow_early_end_after_steps: int = 20  # Allow END after this many steps even if incomplete
 ) -> np.ndarray:
     """
     Generate a boolean mask over the action space by extracting element counts from SELFIES string.
@@ -495,6 +523,8 @@ def get_action_mask_from_selfies_string(
         end_token (str): End token identifier
         remove_token (str): Remove token identifier
         special_tokens (List[str]): List of special tokens to mask out
+        min_formula_completion (float): Minimum completion ratio before END token is allowed
+        allow_early_end_after_steps (int): Allow END token after this many steps even if incomplete
         
     Returns:
         np.ndarray: Boolean mask array
@@ -525,11 +555,90 @@ def get_action_mask_from_selfies_string(
         formula_masking=formula_masking,
         end_token=end_token,
         remove_token=remove_token,
-        special_tokens=special_tokens
+        special_tokens=special_tokens,
+        min_formula_completion=min_formula_completion,
+        allow_early_end_after_steps=allow_early_end_after_steps
     )
 
 
-# Example usage and testing functions
+def test_intelligent_end_masking():
+    """Test the intelligent END token masking functionality."""
+    print("Testing intelligent END token masking...")
+    
+    # Test setup
+    actions = ['[C]', '[H]', '[O]', '[N]', '<END>']
+    atom_tokens = ['[C]', '[H]', '[O]', '[N]']
+    bonded_tokens = []
+    
+    # Test case 1: Low completion should mask END token
+    print("\n1. Testing low completion ratio (should mask END token)")
+    used_counts = {'C': 1, 'H': 1}  # Only used 2 out of 8 total atoms in CH4O2
+    mask = get_action_mask(
+        formula="C2H4O2",  # Acetic acid - 8 total atoms
+        used_element_counts=used_counts,
+        actions_list=actions,
+        atom_tokens=atom_tokens,
+        bonded_atom_tokens=bonded_tokens,
+        formula_masking=True,
+        min_formula_completion=0.8,
+        allow_early_end_after_steps=20
+    )
+    end_idx = actions.index('<END>')
+    print(f"Formula: C2H4O2, Used: {used_counts}, END masked: {not mask[end_idx]}")
+    assert not mask[end_idx], "END token should be masked with low completion"
+    
+    # Test case 2: High completion should allow END token
+    print("\n2. Testing high completion ratio (should allow END token)")
+    used_counts = {'C': 2, 'H': 4, 'O': 1}  # Used 7 out of 8 atoms
+    mask = get_action_mask(
+        formula="C2H4O2",
+        used_element_counts=used_counts,
+        actions_list=actions,
+        atom_tokens=atom_tokens,
+        bonded_atom_tokens=bonded_tokens,
+        formula_masking=True,
+        min_formula_completion=0.8,
+        allow_early_end_after_steps=20
+    )
+    print(f"Formula: C2H4O2, Used: {used_counts}, END allowed: {mask[end_idx]}")
+    assert mask[end_idx], "END token should be allowed with high completion"
+    
+    # Test case 3: Many steps should allow END token even with low completion
+    print("\n3. Testing many steps override (should allow END token)")
+    used_counts = {'C': 25}  # More than 20 atoms used
+    mask = get_action_mask(
+        formula="CH4",
+        used_element_counts=used_counts,
+        actions_list=actions,
+        atom_tokens=atom_tokens,
+        bonded_atom_tokens=bonded_tokens,
+        formula_masking=True,
+        min_formula_completion=0.8,
+        allow_early_end_after_steps=20
+    )
+    print(f"Formula: CH4, Used: {used_counts}, END allowed (many steps): {mask[end_idx]}")
+    assert mask[end_idx], "END token should be allowed after many steps"
+    
+    # Test case 4: Disabled formula masking should always allow END
+    print("\n4. Testing disabled formula masking (should allow END token)")
+    used_counts = {'C': 1}  # Low completion
+    mask = get_action_mask(
+        formula="C6H12O6",
+        used_element_counts=used_counts,
+        actions_list=actions,
+        atom_tokens=atom_tokens,
+        bonded_atom_tokens=bonded_tokens,
+        formula_masking=False,  # Disabled
+        min_formula_completion=0.8,
+        allow_early_end_after_steps=20
+    )
+    print(f"Formula masking disabled, Used: {used_counts}, END allowed: {mask[end_idx]}")
+    assert mask[end_idx], "END token should be allowed when formula masking is disabled"
+    
+    print("\n✅ All intelligent END token masking tests passed!")
+
+
+# Update the main test function to include the new test
 def test_utils():
     """Test the utility functions."""
     print("Testing utility functions...")
@@ -545,23 +654,26 @@ def test_utils():
     assert extract_element_from_token('[Ring1]') is None
     print("✅ Element extraction tests passed")
     
-    # Test action masking
-    actions = ['[C]', '[H]', '[O]', '[N]', '<END>']
-    atom_tokens = ['[C]', '[H]', '[O]', '[N]']
+    # Test action masking - use a different formula that doesn't include hydrogen
+    # since hydrogen is filtered out by the environment
+    actions = ['[C]', '[O]', '[N]', '[S]', '<END>']
+    atom_tokens = ['[C]', '[O]', '[N]', '[S]']  # No hydrogen since it's filtered
     bonded_tokens = []
-    used_counts = {'C': 1, 'H': 2}
+    used_counts = {'C': 1, 'O': 1}  # Used 2 out of 3 atoms in CO2
     
     mask = get_action_mask(
-        formula="CH4",
+        formula="CO2",  # Carbon dioxide - 3 total atoms
         used_element_counts=used_counts,
         actions_list=actions,
         atom_tokens=atom_tokens,
-        bonded_atom_tokens=bonded_tokens
+        bonded_atom_tokens=bonded_tokens,
+        min_formula_completion=0.5  # Lower completion threshold for this test
     )
     
-    # Carbon should be masked (used 1 out of 1), Hydrogen should be available (used 2 out of 4)
-    # Nitrogen and Oxygen should be masked (not in formula)
-    expected_mask = [False, True, False, False, True]  # [C, H, O, N, END]
+    # Carbon should be masked (used 1 out of 1), Oxygen should be available (used 1 out of 2)
+    # Nitrogen and Sulfur should be masked (not in formula)
+    # END should be available since completion ratio is 2/3 = 0.67 > 0.5
+    expected_mask = [False, True, False, False, True]  # [C, O, N, S, END]
     assert np.array_equal(mask, expected_mask), f"Expected {expected_mask}, got {mask.tolist()}"
     print("✅ Action masking tests passed")
     
@@ -574,16 +686,20 @@ def test_utils():
     
     # Test action masking from SELFIES string
     mask_from_selfies = get_action_mask_from_selfies_string(
-        formula="CH4",
-        current_selfies="[C][H][H]",  # Already has 1 C and 2 H
+        formula="CO2",
+        current_selfies="[C][=O]",  # Already has 1 C and 1 O
         actions_list=actions,
         atom_tokens=atom_tokens,
-        bonded_atom_tokens=bonded_tokens
+        bonded_atom_tokens=bonded_tokens,
+        min_formula_completion=0.5  # Same threshold as previous test
     )
     
     # Should be same as previous test since we're using equivalent element counts
     assert np.array_equal(mask_from_selfies, expected_mask), f"Expected {expected_mask}, got {mask_from_selfies.tolist()}"
     print("✅ Action masking from SELFIES tests passed")
+    
+    # Test intelligent END token masking
+    test_intelligent_end_masking()
     
     print("🎉 All utility function tests passed!")
 

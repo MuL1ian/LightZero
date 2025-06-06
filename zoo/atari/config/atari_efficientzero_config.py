@@ -14,8 +14,8 @@ n_episode = 8
 evaluator_env_num = 3
 num_simulations = 50
 batch_size = 256
-max_env_step = int(5e5)
-reanalyze_ratio = 0.
+max_env_step = int(5e3)
+reanalyze_rat3o = 0.
 num_unroll_steps = 5
 # ==============================================================
 # end of the most frequently changed config specified by the user

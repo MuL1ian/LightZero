@@ -605,19 +605,50 @@ def load_pretrained_model(checkpoint_path: str, device: str = "cuda") -> Tuple[M
     """加载预训练模型"""
     print(f"Loading model from {checkpoint_path}")
     
+    # Import required classes and modules
+    import torch.serialization
+    import sys
+    from lzero.model.muzero_transformer import MassSelfiesED, SelfiesTokenizer
+    from lzero.model.pretrain_transformer import PretrainConfig
+    
+    # Add a temporary module alias to handle the module path issue
+    import lzero.model.pretrain_transformer as pretrain_transformer_module
+    if 'pretrain_transformer' not in sys.modules:
+        sys.modules['pretrain_transformer'] = pretrain_transformer_module
+    
     try:
-        # 尝试使用safe_globals方式加载（推荐方式）
-        import torch.serialization
-        with torch.serialization.safe_globals([PretrainConfig]):
-            checkpoint = torch.load(checkpoint_path, map_location=device)
+        # Use safe_globals context manager to allow PretrainConfig to be unpickled
+        # Try both possible module paths since the checkpoint might have been saved with different paths
+        with torch.serialization.safe_globals([PretrainConfig, 'lzero.model.pretrain_transformer.PretrainConfig', 'pretrain_transformer.PretrainConfig']):
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except Exception as e:
-        print(f"Safe loading failed, trying with weights_only=False: {e}")
+        print(f"Safe loading with context manager failed: {e}")
         try:
-            # 备用方案：使用weights_only=False
+            # Alternative: Add safe globals permanently and then load
+            torch.serialization.add_safe_globals([PretrainConfig])
+            # Also try to add the string paths that might be in the checkpoint
+            try:
+                torch.serialization.add_safe_globals(['lzero.model.pretrain_transformer.PretrainConfig'])
+                torch.serialization.add_safe_globals(['pretrain_transformer.PretrainConfig'])
+            except:
+                pass  # These might fail but that's ok
             checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         except Exception as e2:
-            print(f"Both loading methods failed. Error: {e2}")
-            raise e2
+            print(f"Safe loading with add_safe_globals failed: {e2}")
+            try:
+                # Last resort: use the old unsafe method with explicit weights_only=False
+                print("Using unsafe loading method as last resort...")
+                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            except Exception as e3:
+                print(f"All loading methods failed. Final error: {e3}")
+                raise RuntimeError(f"Cannot load checkpoint from {checkpoint_path}. All loading methods failed.") from e3
+    finally:
+        # Clean up the temporary module alias
+        if 'pretrain_transformer' in sys.modules and sys.modules['pretrain_transformer'] is pretrain_transformer_module:
+            del sys.modules['pretrain_transformer']
+    
+    if 'config' not in checkpoint:
+        raise ValueError("Checkpoint file does not contain config")
     
     config = checkpoint['config']
     

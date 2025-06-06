@@ -73,7 +73,7 @@ try:
     from encoder import SpectrumEncoder, load_encoder
     DATASET_AVAILABLE = True
     ENCODER_AVAILABLE = True
-    print("[INFO] FormulaEncoderDataset and SpectrumEncoder imported successfully")
+    # print("[INFO] FormulaEncoderDataset and SpectrumEncoder imported successfully")
 except ImportError as e:
     print(f"[WARN] FormulaEncoderDataset or SpectrumEncoder not available: {e}")
     DATASET_AVAILABLE = False
@@ -254,7 +254,9 @@ class MassGymDataset(Dataset):
     Wrapper around FormulaEncoderDataset for MassGym environment.
     Provides pre-computed spectrum embeddings and proper data format.
     """
-    def __init__(self, data_dir="../reward_model/diffms/data/msg", split="train", use_precomputed=True):
+    def __init__(self, data_dir="../reward_model/diffms/data/msg", split="train", use_precomputed=True,
+                 filter_len = 50, use_filter = False,
+                 ):
         self.use_precomputed = use_precomputed
         self.split = split
         self.spectrum_encoder = None
@@ -271,7 +273,36 @@ class MassGymDataset(Dataset):
             try:
                 self.data = torch.load(embed_file, weights_only=False)
                 self.size = len(self.data['formulas'])
-                print(f"[INFO] Loaded {self.size} pre-computed samples from {embed_file}")
+                if use_filter:
+                    # filter the data by the length of the selfies string
+                    # print(f"[INFO] Filtering data by SELFIES length <= {filter_len}")
+                    
+                    # Convert all SMILES to SELFIES and check their lengths
+                    valid_indices = []
+                    for i, smiles in enumerate(self.data['smiles']):
+                        try:
+                            selfies_str = sf.encoder(smiles)
+                            if selfies_str and len(selfies_str) <= filter_len:
+                                valid_indices.append(i)
+                        except Exception as e:
+                            # Skip invalid SMILES that can't be converted to SELFIES
+                            continue
+                    
+                    # Filter all data fields based on valid indices
+                    filtered_data = {}
+                    for key, value in self.data.items():
+                        if isinstance(value, list):
+                            filtered_data[key] = [value[i] for i in valid_indices]
+                        elif isinstance(value, torch.Tensor):
+                            filtered_data[key] = value[valid_indices]
+                        else:
+                            filtered_data[key] = value
+                    
+                    self.data = filtered_data
+                    self.size = len(self.data['formulas'])
+                    # print(f"[INFO] Filtered dataset size: {self.size} samples (SELFIES length <= {filter_len})")
+                
+                # print(f"[INFO] Loaded {self.size} pre-computed samples from {embed_file}")
                 return  # Successfully loaded pre-computed data
             except FileNotFoundError:
                 print(f"[WARN] Pre-computed file {embed_file} not found, falling back to real dataset")
@@ -286,7 +317,7 @@ class MassGymDataset(Dataset):
             abs_data_dir = os.path.join(os.path.dirname(__file__), '../../../../../reward_model/diffms/data/msg')
             self.dataset = FormulaEncoderDataset(data_dir=abs_data_dir)
             self.size = len(self.dataset)
-            print(f"[INFO] Using real FormulaEncoderDataset with {self.size} samples")
+            # print(f"[INFO] Using real FormulaEncoderDataset with {self.size} samples")
             
             # Initialize spectrum encoder for on-the-fly encoding
             if not ENCODER_AVAILABLE:
@@ -605,6 +636,8 @@ class MassGymEnv(gym.Env):
         ignore_legal_actions=False,
 
         need_flatten=False,
+        use_filter=True,
+        filter_len=30,
         
         atom_tokens=[],
         pure_atom_tokens=[],
@@ -617,10 +650,16 @@ class MassGymEnv(gym.Env):
         formula_max_len=50,  # Maximum length for formula tokens
         debug=True,
         
+        # Intelligent END token masking to prevent early termination
+        prevent_early_termination=True,      # Whether to prevent early END token selection
+        min_formula_completion=0.8,          # Minimum completion ratio before END is allowed  
+        allow_early_end_after_steps=20,      # Allow END after this many steps even if incomplete
+        
         # Batched reward computation settings
         enable_batched_rewards=False,  # Enable batched reward computation (deprecated)
         batch_size=32,                 # Maximum batch size for reward computation
         batch_timeout=0.1,             # Timeout for batching (seconds)
+        client_timeout=None,           # Timeout for client requests to reward server (seconds, auto-calculated if None)
         reward_network_checkpoint=None, # Path to reward network checkpoint
         use_reward_server=None,        # Whether to use reward server (auto-detect if None)
     )
@@ -659,18 +698,20 @@ class MassGymEnv(gym.Env):
                 enable_batching = cfg.get('enable_batched_rewards', False)
                 batch_size = cfg.get('batch_size', 32)
                 batch_timeout = cfg.get('batch_timeout', 0.1)
+                client_timeout = cfg.get('client_timeout', None)
                 
                 # Determine the reward computation strategy
                 if use_reward_server is True:
-                    print(f"[INFO] Configured to use reward server (batch_size={batch_size}, timeout={batch_timeout}s)")
+                    pass
+                    # print(f"[INFO] Configured to use reward server (batch_size={batch_size}, timeout={batch_timeout}s)")
                 elif use_reward_server is None:
                     # Auto-detect: use reward server for subprocess environments
                     import multiprocessing as mp
                     current_process = mp.current_process()
-                    if current_process.name != 'MainProcess':
-                        print(f"[INFO] Auto-detected subprocess environment, will use reward server")
-                    else:
-                        print(f"[INFO] Auto-detected main process, will start reward server if needed")
+                    # if current_process.name != 'MainProcess':
+                    #     print(f"[INFO] Auto-detected subprocess environment, will use reward server")
+                    # else:
+                    #     print(f"[INFO] Auto-detected main process, will start reward server if needed")
                 elif enable_batching:
                     print(f"[INFO] Configured to use batched rewards (batch_size={batch_size}, timeout={batch_timeout}s)")
                 else:
@@ -691,7 +732,8 @@ class MassGymEnv(gym.Env):
                         enable_batching=enable_batching,
                         batch_size=batch_size,
                         batch_timeout=batch_timeout,
-                        use_reward_server=use_reward_server
+                        use_reward_server=use_reward_server,
+                        client_timeout=client_timeout
                     )
                 
                 self.reward_function = global_reward_network.get_reward_function()
@@ -700,7 +742,8 @@ class MassGymEnv(gym.Env):
                 # Report the actual reward computation method being used
                 try:
                     if global_reward_network.is_reward_server_enabled():
-                        print(f"[INFO] ✓ Using reward server (batch_size={batch_size}, timeout={batch_timeout}s)")
+                        pass
+                        # print(f"[INFO] ✓ Using reward server (batch_size={batch_size}, timeout={batch_timeout}s)")
                     elif global_reward_network.is_batching_enabled():
                         print(f"[INFO] ✓ Using batched reward network (batch_size={batch_size}, timeout={batch_timeout}s)")
                     else:
@@ -723,6 +766,11 @@ class MassGymEnv(gym.Env):
         self.need_flatten = cfg.get('need_flatten', False)
 
         self.formula_masking = cfg.get('formula_masking', True)
+        
+        # Intelligent END token masking configuration
+        self.prevent_early_termination = cfg.get('prevent_early_termination', True)
+        self.min_formula_completion = cfg.get('min_formula_completion', 0.8)
+        self.allow_early_end_after_steps = cfg.get('allow_early_end_after_steps', 20)
         
         self.chance = 0.0
         
@@ -799,18 +847,21 @@ class MassGymEnv(gym.Env):
         self.current_selfies = ""
         self.bond_counts = []
         self.smiles = ""
+        self.gt_selfies = ""
 
         self.bond_constraints = cfg.get('bond_constraints', get_bond_constraints())
         
         # Initialize dataset with proper integration
         if self.debug:
-            print("Using debug dataset")
-            print("================")
+            # print("Using debug dataset")
+            # print("================")
             self.train_info = MassGymDataset(split="debug", use_precomputed=True)
         else:
-            print("Using train dataset")
-            print("================")
-            self.train_info = MassGymDataset(split="train", use_precomputed=True)
+            # print("Using train dataset")
+            # print("================")
+            self.train_info = MassGymDataset(split="train", use_precomputed=True, 
+                                             use_filter=cfg.get('use_filter', False),
+                                             filter_len=cfg.get('filter_len', 50))
 
         self.reset()
         self._init_flag = True
@@ -822,7 +873,7 @@ class MassGymEnv(gym.Env):
         sample = self.train_info.random_sample()
         embeds = sample['embeds']
         formula = sample['formulas']
-        
+        self.gt_selfies = sample['selfies_string']
         self.target_spectrum = {
             'embeds': embeds,
             'formulas': formula
@@ -957,18 +1008,36 @@ class MassGymEnv(gym.Env):
         formula = self.target_spectrum.get('formulas', '') if hasattr(self, 'target_spectrum') else ''
         used_counts = getattr(self, 'used_element_counts', {})
         
-        return get_action_mask(
-            formula=formula,
-            used_element_counts=used_counts,
-            actions_list=self.actions_list,
-            atom_tokens=self.atom_tokens,
-            bonded_atom_tokens=self.bonded_atom_tokens,
-            current_selfies=self.current_selfies,
-            formula_masking=self.formula_masking,
-            end_token=self.end_token,
-            remove_token=self.remove_token,
-            special_tokens=self.tokenizer_special_tokens
-        )
+        # Apply intelligent END token masking if enabled
+        if self.prevent_early_termination:
+            return get_action_mask(
+                formula=formula,
+                used_element_counts=used_counts,
+                actions_list=self.actions_list,
+                atom_tokens=self.atom_tokens,
+                bonded_atom_tokens=self.bonded_atom_tokens,
+                current_selfies=self.current_selfies,
+                formula_masking=self.formula_masking,
+                end_token=self.end_token,
+                remove_token=self.remove_token,
+                special_tokens=self.tokenizer_special_tokens,
+                min_formula_completion=self.min_formula_completion,
+                allow_early_end_after_steps=self.allow_early_end_after_steps
+            )
+        else:
+            # Use original behavior for backward compatibility
+            return get_action_mask(
+                formula=formula,
+                used_element_counts=used_counts,
+                actions_list=self.actions_list,
+                atom_tokens=self.atom_tokens,
+                bonded_atom_tokens=self.bonded_atom_tokens,
+                current_selfies=self.current_selfies,
+                formula_masking=self.formula_masking,
+                end_token=self.end_token,
+                remove_token=self.remove_token,
+                special_tokens=self.tokenizer_special_tokens
+            )
 
 
 
@@ -1012,7 +1081,7 @@ class MassGymEnv(gym.Env):
         done = False
         self._timestep += 1
         if self.episode_length >= self.max_episode_steps:
-            # print("debug: episode length >= max_episode_steps")
+            print("debug: episode length >= max_episode_steps")
             done = True
         if action_name == self.remove_token:
             if len(self.bond_counts) == 0:
@@ -1042,6 +1111,11 @@ class MassGymEnv(gym.Env):
                     raw_reward = -0.5
         else:
             if action_name == self.end_token or self.episode_length >= self.max_episode_steps:
+                # if self.episode_length >= self.max_episode_steps:
+                    # print("debug: done by episode length >= max_episode_steps") 
+                # else:
+                    # print("debug: done by action_name == self.end_token")
+                    # print(f"debug: current selfies: {self.current_selfies},\ntarget selfies: {sf.encoder(self.smiles)}") 
                 done = True
                 self.should_done = True
                 # Use reward network for final reward computation
@@ -1157,8 +1231,24 @@ class MassGymEnv(gym.Env):
         if self.current_selfies:
             info["current_selfies"] = self.current_selfies
         
+        # Add GAG-specific information at every step for faster data collection
+        # This allows the GAG collector to extract pairs without waiting for episode completion
+        info['generated_selfies'] = self.current_selfies  # What the agent has produced so far
+        info['target_selfies'] = self.gt_selfies  # Ground-truth target SELFIES
+        info['ground_truth_selfies'] = self.gt_selfies  # Alternative key for ground-truth
+        info['spectrum_embed'] = self.target_spectrum['embeds']  # Target spectrum embedding
+        info['target_spectrum'] = self.target_spectrum['embeds']  # Alternative key for spectrum
+        info['final_selfies'] = self.current_selfies  # Alternative key for generated
+        info['agent_selfies'] = self.current_selfies  # Alternative key for generated
+        info['episode_reward'] = self._final_eval_reward  # Current episode reward
+        info['episode_length'] = self.episode_length  # Current episode length
+        
         if done:
             info['eval_episode_return'] = self._final_eval_reward
+            
+            # Mark this as final episode data for GAG logging
+            info['episode_complete'] = True
+            
             if self.render_mode == 'image_savefile_mode':
                 self.save_render_output(
                     replay_name_suffix=self.replay_name_suffix,

@@ -13,16 +13,16 @@ from easydict import EasyDict
 from lzero.model import global_reward_network
 
 # Number of environments for training
-collector_env_num = 32
-evaluator_env_num = 32
-
+collector_env_num = 256
+evaluator_env_num = 256
 # NEW: Configure reward server for subprocess-based environments
 # The reward server runs in a dedicated process and handles batched reward computation
 # for all environment subprocesses, solving the multiprocessing limitations of the old system
 reward_server_config = {
     'use_reward_server': True,        # Enable reward server for subprocess environments
-    'batch_size': 32,                  # Batch size for reward server (smaller for responsiveness)
-    'batch_timeout': 0.1,            # Timeout for batching (seconds)
+    'batch_size': 256,                  # Batch size for reward server (smaller for responsiveness)
+    'batch_timeout': 20.0,            # Timeout for batching (seconds)
+    'client_timeout': 20.0,           # Timeout for client requests (auto-calculated if None: min(60.0, max(5.0, batch_timeout * 10 + 5)))
     'enable_batched_rewards': False,  # Disable old batching system
 }
 
@@ -30,8 +30,9 @@ reward_server_config = {
 # This is kept for backward compatibility but should not be used with subprocess environments
 batched_reward_config = global_reward_network.configure_batched_rewards_for_training(
     num_envs=collector_env_num + evaluator_env_num,
-    auto_batch_size=True,  # Automatically calculate optimal batch size
-    batch_timeout=None     # Automatically calculate optimal timeout
+    auto_batch_size=False,  # Automatically calculate optimal batch size
+    batch_timeout=reward_server_config['batch_timeout'],
+    batch_size=reward_server_config['batch_size']
 )
 
 # Disable old batching system to avoid conflicts with reward server
@@ -58,13 +59,16 @@ massgym_batched_config = dict(
     # Experiment name
     exp_name=f'data_muzero/massgym_reward_server_ce{collector_env_num}_ee{evaluator_env_num}_seed0',
     
+    # Weights & Biases logging configuration
+    wandb_freq=1,  # Upload to wandb every step for maximum monitoring detail
+    
     env=dict(
         type='massgym_lightzero',  # Fixed: use the wrapper instead of raw environment
         import_names=['zoo.masspecgym.envs.massgym_wrapper'],  # Fixed: import the wrapper
         env_id='mass_spec_env',
         
         # Basic environment settings
-        max_episode_steps=50,
+        max_episode_steps=100,
         obs_type='fingerprint',
         reward_type='cosine_similarity',
         reward_normalize=False,
@@ -81,7 +85,7 @@ massgym_batched_config = dict(
         # SELFIES and formula settings
         max_len=100,
         formula_masking=True,
-        formula_max_len=50,
+        formula_max_len=60,
         
         # Rendering settings
         render_mode=None,
@@ -105,62 +109,116 @@ massgym_batched_config = dict(
         
         # Debug settings
         debug=False,  # Set to True for smaller dataset
+        use_filter=True,
+        filter_len=75,
     ),
+    
+    # ================================================================================
+    # PRETRAINED MODEL LOADING CONFIGURATION
+    # ================================================================================
+    # 
+    # POLICY VALUE NETWORK (MuZeroSelfiesTransformerEnhanced):
+    # - NOW LOADING pretrained MassSelfiesED transformer component
+    # - pretrained_transformer_path="pretrained_selfies_transformer/best_model.pt"
+    # - model_path=None (no complete policy checkpoint)
+    # - MuZero networks (representation, dynamics, prediction) train from scratch
+    # - Transformer backbone (self.transformer) uses pretrained weights
+    # 
+    # REWARD NETWORK:
+    # - reward_network_checkpoint loads pretrained reward model
+    # - Used for environment reward computation
+    # ================================================================================
     
     # Policy configuration (example for MuZero)
     policy=dict(
-        type='muzero',
-        import_names=['lzero.policy.muzero'],
+        type='gag_muzero',
+        import_names=['lzero.policy.gag_muzero'],
         
         # Model settings
         model=dict(
-            observation_shape=4246,  # Fixed: should be integer, not tuple (4096 + 100 + 50)
-            action_space_size=70,    # Fixed: set to actual action space size (will be updated by environment)
+            observation_shape=4256,  # 4096 (spectrum) + 100 (SELFIES max_len) + 60 (formula_max_len)
+            action_space_size=69,    # Fixed: set to actual action space size (will be updated by environment)
             model_type='mlp',
             categorical_distribution=False,
             latent_state_dim=512,
             state_norm=False,
             self_supervised_learning_loss=False,
+            use_transformer=True,
+            pretrained_transformer_path="pretrained_selfies_transformer/best_model.pt",
+            formula_max_len=60,  # Ensure model matches environment observation structure
+            load_pretrained_transformer=True,
         ),
         
         # Required policy settings
-        model_path=None,
+        model_path=None,  # No pretrained policy checkpoint available
         cuda=True,
         env_type='not_board_games',
         action_type='varied_action_space',
-        game_segment_length=50,
+        game_segment_length=100,
         
         # MCTS settings
         mcts_ctree=True,
-        simulation_num=50,
+        simulation_num=32,
         batch_size=256,
         
         # Training settings
-        learning_rate=0.003,
-        num_simulations=50,
+        learning_rate=1e-5,
+        num_simulations=32,
         max_moves=100,
-        update_per_collect=100,
+        update_per_collect=1,
         optim_type='Adam',
         
         # Additional required parameters
-        max_num_considered_actions=32,
+        max_num_considered_actions=16,
         piecewise_decay_lr_scheduler=False,
         ssl_loss_weight=2,
         reanalyze_ratio=0.0,
         n_episode=collector_env_num,
         eval_freq=int(2e2),
-        replay_buffer_size=int(1e6),
+        replay_buffer_size=int(2e3),
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
-        
+        discount_factor=1.0,
         # Reward network integration
         use_reward_network=True,
         reward_network_checkpoint='reward_model/diffms/models/reward_model/best_model.pt',
+        
+        # Weights & Biases logging configuration
+        use_wandb=True,  # Enable wandb logging
+        
+        # GAG MuZero adversarial training configuration
+        enable_adversarial_training=True,
+        adversarial_loss_weight=0.1,
+        preference_loss_weight=0.05,
+        preference_temperature=1.0,
+        use_global_reward_network=True,
+        normalize_rewards=True,
+        reward_norm_scale=10.0,
+        use_curriculum_learning=False,
+        curriculum_steps=5000,
+        
+        # Server-based reward network training configuration  
+        reward_network_learning_rate=1e-4,
+        reward_network_weight_decay=1e-4,
+        training_batch_size=256,
+        training_timeout=10.0,
+    ),
+    
+    # Weights & Biases logger configuration
+    wandb_logger=dict(
+        gradient_logger=True,    # Log gradients to wandb
+        video_logger=False,      # Log videos (not applicable for this environment)
+        plot_logger=True,        # Log plots to wandb
+        action_logger=True,      # Log action distributions
+        return_logger=True,      # Log episode returns
     ),
     
     # Training configuration
     seed=0,
     
+    # Collection configuration
+    collection_steps_per_iter=int(1024/collector_env_num),  # Number of data collection steps per training iteration
+
     # Collector settings
     collector=dict(
         type='episode',
@@ -176,7 +234,7 @@ massgym_batched_config = dict(
     
     # Replay buffer settings
     replay_buffer=dict(
-        replay_buffer_size=int(1e6),
+        replay_buffer_size=int(2e3),
         batch_size=256,
     ),
 )
@@ -193,8 +251,8 @@ massgym_batched_create_config = dict(
     ),
     env_manager=dict(type='subprocess'),
     policy=dict(
-        type='muzero',
-        import_names=['lzero.policy.muzero'],
+        type='gag_muzero',
+        import_names=['lzero.policy.gag_muzero'],
     ),
 )
 massgym_batched_create_config = EasyDict(massgym_batched_create_config)
@@ -240,6 +298,16 @@ atexit.register(cleanup_on_exit)
 # Use the configuration for training
 config = massgym_batched_config
 
+# EXAMPLE: Modify collection steps for different training scenarios
+# For faster iteration cycles (good for debugging):
+# config.collection_steps_per_iter = 4
+
+# For standard training (default):
+# config.collection_steps_per_iter = 16
+
+# For longer collection cycles (potentially more stable):
+# config.collection_steps_per_iter = 32
+
 # Your training code here...
 # The environments will automatically use batched reward computation
 """
@@ -263,12 +331,19 @@ PERFORMANCE_NOTES = """
    - Recommended: 16+ environments for good batching
    - Monitor queue sizes to ensure environments aren't starved
 
-4. Memory Considerations:
+4. Collection Steps Configuration:
+   - collection_steps_per_iter: Controls how many collection steps per training iteration
+   - Default: 16 steps (previously hardcoded)
+   - Higher values = more data collection per iteration, longer iterations
+   - Lower values = faster iteration cycles, potentially less stable learning
+   - Recommended: 4-32 depending on environment complexity and training stability
+
+5. Memory Considerations:
    - Batched processing uses more GPU memory
    - Monitor GPU memory usage during training
    - Reduce batch size if running out of memory
 
-5. Debugging:
+6. Debugging:
    - Use get_batching_stats() to monitor performance
    - Check processor_alive status if rewards seem slow
    - Disable batching temporarily to isolate issues
@@ -279,6 +354,69 @@ Expected Performance Improvements:
 - Diminishing returns beyond 64 environments
 
 ===========================================
+"""
+
+# Weights & Biases Configuration Notes
+WANDB_NOTES = """
+=== Weights & Biases Logging Configuration ===
+
+The configuration now includes comprehensive wandb logging:
+
+1. Policy Configuration:
+   - use_wandb=True: Enables wandb logging throughout the training process
+   - Logs training metrics, losses, and GAG-specific statistics
+
+2. Logger Configuration:
+   - gradient_logger=True: Logs gradient norms and distributions
+   - plot_logger=True: Logs training plots and visualizations
+   - action_logger=True: Logs action selection statistics
+   - return_logger=True: Logs episode returns and rewards
+
+3. Automatic Logging:
+   - Training losses and metrics are logged every step
+   - Environment statistics are logged during collection
+   - Model gradients are monitored for debugging
+   - GAG-specific metrics (adversarial loss, preference loss, etc.)
+
+4. Project Organization:
+   - Project name: "LightZero"
+   - Run name is auto-generated based on experiment configuration
+   - All configuration parameters are logged to wandb
+
+5. Performance Impact:
+   - Minimal overhead for metric logging
+   - Gradient logging may add slight overhead but provides valuable insights
+   - Video logging is disabled (not applicable for this environment)
+
+To view your experiment:
+1. Install wandb: pip install wandb
+2. Login: wandb login
+3. Run your training script
+4. View results at: https://wandb.ai/
+
+===========================================
+"""
+
+# PRETRAINED MODEL LOADING STATUS SUMMARY
+PRETRAINED_MODEL_STATUS = """
+=== TRANSFORMER PRETRAINED MODEL LOADING STATUS ===
+
+✅ POLICY VALUE NETWORK (MuZeroSelfiesTransformerEnhanced):
+   - NOW LOADING pretrained MassSelfiesED transformer component
+   - pretrained_transformer_path="pretrained_selfies_transformer/best_model.pt"
+   - model_path=None (no complete policy checkpoint)
+   - MuZero networks (representation, dynamics, prediction) train from scratch
+   - Transformer backbone (self.transformer) uses pretrained weights
+
+✅ REWARD NETWORK:
+   - Successfully loads pretrained reward model
+   - reward_network_checkpoint='reward_model/diffms/models/reward_model/best_model.pt'
+   - Used for environment reward computation
+
+CLARIFICATION:
+- model_path: For complete trained policy checkpoints (representation + dynamics + prediction networks)
+
+CURRENT STATUS: Ready to run with pretrained transformer and reward network
 """
 
 if __name__ == "__main__":
@@ -307,28 +445,36 @@ if __name__ == "__main__":
     print(f"Batched rewards enabled: {batched_reward_config['enable_batched_rewards']}")
     print(f"Batch size: {batched_reward_config['batch_size']}")
     print(f"Batch timeout: {batched_reward_config['batch_timeout']:.3f}s")
+    print(f"Wandb logging enabled: {main_config.policy.use_wandb}")
     print("\nPerformance Notes:")
     print(PERFORMANCE_NOTES)
+    print("\nWandB Configuration:")
+    print(WANDB_NOTES)
     
     # Training configuration
-    entry_type = "train_muzero"
-    max_env_step = int(1e4)
+    entry_type = "train_gag_muzero"
+    max_env_step = int(2e7)
     
     print(f"\nStarting training with entry type: {entry_type}")
     print(f"Maximum environment steps: {max_env_step}")
     print("Batched reward computation will be automatically enabled...")
+    print("Wandb logging will be automatically initialized...")
     
     if entry_type == "train_muzero":
         from lzero.entry import train_muzero
     elif entry_type == "train_muzero_with_gym_env":
         from lzero.entry import train_muzero_with_gym_env as train_muzero
+    elif entry_type == "train_gag_muzero":
+        from lzero.entry import train_gag_muzero as train_muzero
     else:
         raise ValueError(f"Unknown entry type: {entry_type}")
     
-    # Start training with batched rewards
+    # Start training with batched rewards and wandb logging
     train_muzero(
         [main_config, create_config], 
         seed=0, 
         model_path=main_config.policy.get('model_path', None), 
         max_env_step=max_env_step
-    ) 
+    )
+
+    print(PRETRAINED_MODEL_STATUS) 

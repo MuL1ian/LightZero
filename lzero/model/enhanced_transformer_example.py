@@ -54,7 +54,7 @@ class EnhancedMoleculeGenerator:
             completion_status = self.model._check_completion_status(current_selfies)
             
             if completion_status[0]:
-                print(f"Molecule completed at step {step}: {current_selfies[0]}")
+                # print(f"Molecule completed at step {step}: {current_selfies[0]}")
                 return {
                     'success': True,
                     'final_selfies': current_selfies[0],

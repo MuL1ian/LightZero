@@ -365,9 +365,19 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
         log_pred  = torch.log(pred_probs)
 
         target_probs = torch.from_numpy(improved_policy_batch[:, 0]).to(self._cfg.device).detach().float()
+        
+        # Handle dimension mismatch between model output and collected data
+        # Model outputs full tokenizer vocabulary (75) but environment uses filtered actions (69)
+        if log_pred.shape[-1] > target_probs.shape[-1]:
+            # Truncate model output to match environment action space size
+            log_pred = log_pred[:, :target_probs.shape[-1]]
+        elif target_probs.shape[-1] > log_pred.shape[-1]:
+            # Truncate target to match model output size (fallback case)
+            target_probs = target_probs[:, :log_pred.shape[-1]]
+        
         target_probs = torch.clamp(target_probs, min=1e-8)  # avoid 0 * log(0)
         target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)  # re-normalise
-
+        assert target_probs.shape == log_pred.shape, f"target_probs.shape: {target_probs.shape}, log_pred.shape: {log_pred.shape}"
         policy_loss = self.kl_loss(log_pred, target_probs)
         policy_loss = policy_loss.mean(dim=-1) * mask_batch[:, 0]
         # Output the entropy for experimental observation.
@@ -422,9 +432,19 @@ class GumbelMuZeroPolicy(MuZeroPolicy):
             log_pred  = torch.log(pred_probs)
 
             target_probs = torch.from_numpy(improved_policy_batch[:, step_k + 1]).to(self._cfg.device).detach().float()
+            
+            # Handle dimension mismatch between model output and collected data
+            # Model outputs full tokenizer vocabulary (75) but environment uses filtered actions (69)
+            if log_pred.shape[-1] > target_probs.shape[-1]:
+                # Truncate model output to match environment action space size
+                log_pred = log_pred[:, :target_probs.shape[-1]]
+            elif target_probs.shape[-1] > log_pred.shape[-1]:
+                # Truncate target to match model output size (fallback case)
+                target_probs = target_probs[:, :log_pred.shape[-1]]
+            
             target_probs = torch.clamp(target_probs, min=1e-8)
             target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
-
+            assert target_probs.shape == log_pred.shape, f"target_probs.shape: {target_probs.shape}, log_pred.shape: {log_pred.shape}"
             policy_loss += self.kl_loss(log_pred, target_probs).mean(dim=-1) * mask_batch[:, step_k + 1]
             assert not torch.isnan(policy_loss).any(), f"policy_loss has nan: {policy_loss}"
             # value_loss += cross_entropy_loss(value, target_value_categorical[:, step_k + 1])

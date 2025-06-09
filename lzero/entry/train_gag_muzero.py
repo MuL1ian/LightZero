@@ -21,7 +21,10 @@ from lzero.worker import MuZeroCollector as Collector
 from lzero.worker import MuZeroEvaluator as Evaluator
 # Import GAG-specific components
 from lzero.worker.gag_muzero_collector import GAGMuZeroCollector
-from .utils import random_collect, calculate_update_per_collect
+try:
+    from .utils import random_collect, calculate_update_per_collect
+except ImportError:
+    from utils import random_collect, calculate_update_per_collect
 
 
 def log_to_wandb(data_dict, step=None, prefix=""):
@@ -129,14 +132,14 @@ def train_gag_muzero(
             tags=[create_cfg.policy.type, "molecular_generation", "mass_spectrometry"],
         )
         
-        # Log initial configuration
+        # Log initial configuration (don't specify step to avoid conflicts)
         if get_rank() == 0:
-            log_to_wandb({
-                'config/algorithm': create_cfg.policy.type,
-                'config/wandb_freq': wandb_freq,
-                'config/collection_steps': cfg.get('collection_steps_per_iter', 16),
-                'config/batch_size': cfg.policy.batch_size,
-                'config/learning_rate': cfg.policy.learn.learner.optimizer.lr,
+            wandb.config.update({
+                'algorithm': create_cfg.policy.type,
+                'wandb_freq': wandb_freq,
+                'collection_steps': cfg.get('collection_steps_per_iter', 16),
+                'batch_size': cfg.policy.batch_size,
+                'learning_rate': cfg.policy.learning_rate,
             })
 
     policy = create_policy(cfg.policy, model=model, enable_field=['learn', 'collect', 'eval'])
@@ -173,6 +176,93 @@ def train_gag_muzero(
         # CRITICAL: Connect policy and collector for GAG adversarial training
         if hasattr(policy, 'set_collector'):
             policy.set_collector(collector)
+        
+        # Set up reward function and vocabulary for ground-truth trajectory generation
+        if hasattr(policy, '_reward_function') and policy._reward_function is not None:
+            collector.set_reward_function(policy._reward_function)
+        
+        # Set target ground-truth trajectory ratio (configurable)
+        target_gt_ratio = cfg.get('target_gt_ratio', 0.3)  # Default to 30%
+        if hasattr(collector, 'set_target_gt_ratio'):
+            collector.set_target_gt_ratio(target_gt_ratio)
+        
+        # Try to get vocabulary from the policy or environment
+        vocab_dict = None
+        
+        # Try multiple sources for vocabulary with debug logging
+        if get_rank() == 0:
+            logging.info("GAG MuZero: Searching for vocabulary...")
+            
+        # PRIORITY 1: Get vocabulary directly from environment tokenizer (matches actual env)
+        if hasattr(collector_env, 'tokenizer') and hasattr(collector_env.tokenizer, 'get_vocab'):
+            vocab_dict = collector_env.tokenizer.get_vocab()
+            if get_rank() == 0:
+                logging.info("GAG MuZero: Found vocabulary from collector_env.tokenizer.get_vocab()")
+        # PRIORITY 2: Get from environment's vocab method
+        elif hasattr(collector_env, 'get_vocab'):
+            vocab_dict = collector_env.get_vocab()
+            if get_rank() == 0:
+                logging.info("GAG MuZero: Found vocabulary from collector_env.get_vocab()")
+        # PRIORITY 3: Get from policy model tokenizer
+        elif hasattr(policy, '_learn_model') and hasattr(policy._learn_model, 'selfies_tokenizer'):
+            if hasattr(policy._learn_model.selfies_tokenizer, 'get_vocab'):
+                vocab_dict = policy._learn_model.selfies_tokenizer.get_vocab()
+                if get_rank() == 0:
+                    logging.info("GAG MuZero: Found vocabulary from policy._learn_model.selfies_tokenizer.get_vocab()")
+            elif hasattr(policy._learn_model.selfies_tokenizer, 'vocab'):
+                vocab_dict = policy._learn_model.selfies_tokenizer.vocab
+                if get_rank() == 0:
+                    logging.info("GAG MuZero: Found vocabulary from policy._learn_model.selfies_tokenizer.vocab")
+        elif hasattr(policy, '_learn_model') and hasattr(policy._learn_model, 'transformer') and hasattr(policy._learn_model.transformer, 'tokenizer'):
+            if hasattr(policy._learn_model.transformer.tokenizer, 'get_vocab'):
+                vocab_dict = policy._learn_model.transformer.tokenizer.get_vocab()
+                if get_rank() == 0:
+                    logging.info("GAG MuZero: Found vocabulary from policy._learn_model.transformer.tokenizer.get_vocab()")
+        elif hasattr(policy, '_learn_model') and hasattr(policy._learn_model, 'tok'):
+            if hasattr(policy._learn_model.tok, 'get_vocab'):
+                vocab_dict = policy._learn_model.tok.get_vocab()
+                if get_rank() == 0:
+                    logging.info("GAG MuZero: Found vocabulary from policy._learn_model.tok.get_vocab()")
+        elif hasattr(policy, 'vocab'):
+            vocab_dict = policy.vocab
+            if get_rank() == 0:
+                logging.info("GAG MuZero: Found vocabulary from policy.vocab")
+        
+        # If we still don't have vocab, create extended SELFIES vocabulary
+        if vocab_dict is None:
+            if get_rank() == 0:
+                logging.info("GAG MuZero: Creating extended SELFIES vocabulary for ground-truth trajectories")
+            
+            # Create full vocabulary with semantic robust alphabet
+            import selfies as sf
+            from main.LightZero.lzero.model.selfies_tokenizer import SelfiesTokenizer
+            
+            # Use the same tokenizer as in the model
+            temp_tokenizer = SelfiesTokenizer(max_len=100)
+            vocab_dict = temp_tokenizer.get_vocab().copy()
+        
+        if get_rank() == 0:
+            original_size = len(vocab_dict)
+            logging.info(f"GAG MuZero: Using actual environment tokenizer vocabulary with {original_size} tokens")
+            
+            # Check what tokens are actually in the vocabulary
+            test_tokens = ['[C@H1]', '[C@@H1]', '[/C]', '[\\C]', '[nH]']
+            present_tokens = [token for token in test_tokens if token in vocab_dict]
+            missing_tokens = [token for token in test_tokens if token not in vocab_dict]
+            
+            if present_tokens:
+                print(f"GAG MuZero: Environment tokenizer includes stereochemistry tokens: {len(present_tokens)}/{len(test_tokens)}")
+                print(f"  Present: {present_tokens}")
+            
+            if missing_tokens:
+                print(f"GAG MuZero: Environment tokenizer missing stereochemistry tokens: {len(missing_tokens)}/{len(test_tokens)}")
+                print(f"  Missing: {missing_tokens}")
+                print("GAG MuZero: Using actual tokenizer vocabulary - unknown tokens will be skipped during processing")
+            
+            # DO NOT extend vocabulary - use exactly what the environment has
+            print(f"GAG MuZero: Final vocabulary size: {len(vocab_dict)} tokens (no extension applied)")
+        
+        collector.set_vocab_dict(vocab_dict)
             
         if get_rank() == 0:
             logging.info("GAG MuZero: Using GAG collector for automatic pair extraction")
@@ -233,7 +323,7 @@ def train_gag_muzero(
             'evaluation/reward': reward,
             'evaluation/episode': 0,
             'evaluation/is_random_agent': True,
-        }, step=learner.train_iter, prefix="")
+        }, step=learner.train_iter + 1, prefix="")
 
     while True:
         log_buffer_memory_usage(learner.train_iter, replay_buffer, tb_logger)
@@ -248,7 +338,7 @@ def train_gag_muzero(
             }
             if hasattr(replay_buffer, 'get_buffer_stats'):
                 buffer_stats.update(replay_buffer.get_buffer_stats())
-            log_to_wandb(buffer_stats, step=learner.train_iter)
+            log_to_wandb(buffer_stats, step=learner.train_iter + 1)
         
         collect_kwargs = {}
         # set temperature for visit count distributions according to the train_iter,
@@ -278,7 +368,7 @@ def train_gag_muzero(
                 'exploration/epsilon': collect_kwargs['epsilon'],
                 'training/env_step': collector.envstep,
                 'training/train_iter': learner.train_iter,
-            }, step=learner.train_iter)
+            }, step=learner.train_iter + 1)
 
         # Evaluate policy performance.
         if evaluator.should_eval(learner.train_iter):
@@ -303,7 +393,7 @@ def train_gag_muzero(
                         for key, value in eval_metrics.items():
                             eval_data[f'evaluation/{key}'] = value
                     
-                    log_to_wandb(eval_data, step=learner.train_iter)
+                    log_to_wandb(eval_data, step=learner.train_iter + 1)
                     
                     # Log evaluation milestone
                     logging.info(f"Evaluation at iter {learner.train_iter}: reward={reward:.4f}, env_step={collector.envstep}")
@@ -333,6 +423,9 @@ def train_gag_muzero(
                 gag_pairs = collector.get_collected_pairs()
                 total_gag_pairs += len(gag_pairs)
                 
+                # Get ground-truth trajectories
+                gt_trajectories = collector.get_ground_truth_trajectories() if hasattr(collector, 'get_ground_truth_trajectories') else []
+                
                 if get_rank() == 0 and len(gag_pairs) > 0:
                     avg_episode_reward = sum(p.get('episode_reward', 0.0) for p in gag_pairs) / len(gag_pairs)
                     avg_episode_length = sum(p.get('episode_length', 0) for p in gag_pairs) / len(gag_pairs)
@@ -345,6 +438,7 @@ def train_gag_muzero(
                             'gag/avg_episode_length': avg_episode_length,
                             'gag/total_pairs_this_iter': total_gag_pairs,
                             'gag/collection_step': i + 1,
+                            'gag/ground_truth_trajectories_count': len(gt_trajectories),
                         }
                         
                         # Add more detailed GAG statistics
@@ -358,7 +452,32 @@ def train_gag_muzero(
                                 'gag/max_episode_reward': max(p.get('episode_reward', 0.0) for p in gag_pairs),
                             })
                         
-                        log_to_wandb(gag_data, step=learner.train_iter)
+                        # Add ground-truth trajectory statistics
+                        if len(gt_trajectories) > 0:
+                            avg_gt_reward = sum(t.get('final_reward', 0.0) for t in gt_trajectories) / len(gt_trajectories)
+                            avg_gt_return = sum(t.get('discounted_return', 0.0) for t in gt_trajectories) / len(gt_trajectories)
+                            avg_gt_length = sum(t.get('trajectory_length', 0) for t in gt_trajectories) / len(gt_trajectories)
+                            
+                            gag_data.update({
+                                'gag/avg_gt_final_reward': avg_gt_reward,
+                                'gag/avg_gt_discounted_return': avg_gt_return,
+                                'gag/avg_gt_trajectory_length': avg_gt_length,
+                                'gag/gt_trajectories_with_rewards': sum(1 for t in gt_trajectories if t.get('final_reward', 0) > 0),
+                            })
+                        
+                        # Add replay buffer ratio statistics
+                        if hasattr(collector, 'get_current_gt_ratio'):
+                            current_gt_ratio = collector.get_current_gt_ratio()
+                            target_gt_ratio = getattr(collector, '_target_gt_ratio', 0.3)
+                            
+                            gag_data.update({
+                                'gag/buffer_gt_ratio': current_gt_ratio,
+                                'gag/buffer_gt_ratio_target': target_gt_ratio,
+                                'gag/buffer_gt_count': getattr(collector, '_gt_trajectories_in_buffer', 0),
+                                'gag/buffer_total_count': getattr(collector, '_total_trajectories_in_buffer', 0),
+                            })
+                        
+                        log_to_wandb(gag_data, step=learner.train_iter + 1)
                     
                     if tb_logger:
                         tb_logger.add_scalar('gag_muzero/collected_pairs_count', len(gag_pairs), learner.train_iter)
@@ -379,6 +498,12 @@ def train_gag_muzero(
             replay_buffer.push_game_segments(new_data)
             # remove the oldest data if the replay buffer is full.
             replay_buffer.remove_oldest_data_to_fit()
+            
+            # ==============================================================
+            # GAG MuZero: Inject ground-truth trajectories to maintain 30% ratio
+            # ==============================================================
+            if create_cfg.policy.type == 'gag_muzero' and hasattr(collector, 'inject_ground_truth_trajectories'):
+                collector.inject_ground_truth_trajectories(replay_buffer)
 
         # Log collection summary to wandb
         if use_wandb and get_rank() == 0 and learner.train_iter % wandb_freq == 0:
@@ -396,7 +521,16 @@ def train_gag_muzero(
                     'collection/num_episodes': len(collection_rewards),
                 })
             
-            log_to_wandb(collection_summary, step=learner.train_iter)
+            # Add replay buffer information for GAG MuZero
+            if create_cfg.policy.type == 'gag_muzero' and hasattr(collector, 'get_current_gt_ratio'):
+                buffer_gt_ratio = collector.get_current_gt_ratio()
+                collection_summary.update({
+                    'collection/buffer_size': replay_buffer.get_num_of_transitions(),
+                    'collection/buffer_gt_ratio': buffer_gt_ratio,
+                    'collection/buffer_gt_target': getattr(collector, '_target_gt_ratio', 0.3),
+                })
+            
+            log_to_wandb(collection_summary, step=learner.train_iter + 1)
 
         # Learn policy from collected data.
         for i in range(update_per_collect):
@@ -416,7 +550,16 @@ def train_gag_muzero(
                 policy.set_train_iter_env_step(learner.train_iter, collector.envstep)
 
             # The core train steps for MCTS+RL algorithms.
-            log_vars = learner.train(train_data, collector.envstep)
+            # For GAG MuZero, pass ground-truth trajectories if available
+            if create_cfg.policy.type == 'gag_muzero' and hasattr(collector, 'get_ground_truth_trajectories'):
+                gt_trajectories = collector.get_ground_truth_trajectories()
+                if hasattr(learner, 'policy') and hasattr(learner.policy, 'learn'):
+                    # Pass ground-truth trajectories to the policy's learn method
+                    log_vars = learner.train(train_data, collector.envstep, ground_truth_trajectories=gt_trajectories)
+                else:
+                    log_vars = learner.train(train_data, collector.envstep)
+            else:
+                log_vars = learner.train(train_data, collector.envstep)
 
             # ==============================================================
             # Enhanced training loss logging to wandb
@@ -452,7 +595,7 @@ def train_gag_muzero(
                             if isinstance(value, (int, float)):
                                 training_losses[f'training/{key}'] = value
                     
-                    log_to_wandb(training_losses, step=learner.train_iter)
+                    log_to_wandb(training_losses, step=learner.train_iter + 1)
 
             # ==============================================================
             # GAG MuZero specific training logging
@@ -493,7 +636,7 @@ def train_gag_muzero(
                             if 'reward_gap' in train_info:
                                 gag_training_losses['gag_rewards/reward_gap'] = train_info['reward_gap']
                             
-                            log_to_wandb(gag_training_losses, step=learner.train_iter)
+                            log_to_wandb(gag_training_losses, step=learner.train_iter + 1)
                         
                         if tb_logger is not None:
                             tb_logger.add_scalar('gag_muzero/adversarial_loss', train_info['adversarial_loss'], learner.train_iter)
@@ -537,6 +680,10 @@ def train_gag_muzero(
         if create_cfg.policy.type == 'gag_muzero' and hasattr(collector, 'clear_collected_pairs'):
             # Clear GAG pairs buffer to avoid memory buildup
             collector.clear_collected_pairs()
+            
+            # Clear ground-truth trajectories buffer
+            if hasattr(collector, 'clear_ground_truth_trajectories'):
+                collector.clear_ground_truth_trajectories()
 
         if collector.envstep >= max_env_step or learner.train_iter >= max_train_iter:
             if cfg.policy.eval_offline:
@@ -560,7 +707,7 @@ def train_gag_muzero(
                             'offline_eval/env_step': collector_envstep,
                             'offline_eval/checkpoint_index': eval_idx,
                         }
-                        log_to_wandb(offline_eval_data, step=train_iter)
+                        log_to_wandb(offline_eval_data, step=max(1, train_iter))
                     
                     offline_eval_results.append({
                         'train_iter': train_iter,
@@ -581,7 +728,7 @@ def train_gag_muzero(
                         'offline_eval_summary/avg_reward': sum(rewards) / len(rewards),
                         'offline_eval_summary/reward_improvement': rewards[-1] - rewards[0] if len(rewards) > 1 else 0,
                     }
-                    log_to_wandb(offline_summary, step=learner.train_iter)
+                    log_to_wandb(offline_summary, step=learner.train_iter + 1)
                 
                 logging.info(f'eval offline finished!')
             break
@@ -616,7 +763,7 @@ def train_gag_muzero(
                             if isinstance(value, (int, float)):
                                 final_training_stats[f'final_collector/{key}'] = value
             
-            log_to_wandb(final_training_stats, step=learner.train_iter)
+            log_to_wandb(final_training_stats, step=learner.train_iter + 1)
             
             # Log training completion milestone
             logging.info(f"Training completed: {learner.train_iter} iterations, {collector.envstep} env steps")
@@ -638,7 +785,7 @@ def train_gag_muzero(
                             logging.info(f"Final GAG {key}: {value}")
                     
                     if detailed_final_stats:
-                        log_to_wandb(detailed_final_stats, step=learner.train_iter)
+                        log_to_wandb(detailed_final_stats, step=learner.train_iter + 1)
             else:
                 logging.info("GAG MuZero Training Complete - Statistics method not available")
 
@@ -655,7 +802,7 @@ def train_gag_muzero(
                 'experiment/wandb_freq_used': wandb_freq,
                 'experiment/success': 1.0,
             }
-            log_to_wandb(experiment_metadata, step=learner.train_iter)
+            log_to_wandb(experiment_metadata, step=learner.train_iter + 1)
         
         wandb.finish()
     

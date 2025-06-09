@@ -11,6 +11,7 @@ NEW: Added reward server architecture for subprocess-based environments.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Optional, Dict, Any, Callable, List, Tuple
 import threading
 import multiprocessing as mp
@@ -836,6 +837,7 @@ def _reward_processor_worker(processor_request_queue, processor_response_queue, 
                 if checkpoint_path and os.path.exists(checkpoint_path):
                     checkpoint = torch.load(checkpoint_path, map_location=device)
                     network.load_state_dict(checkpoint, strict=False)
+                    print(f"[INFO] Reward network checkpoint loaded from {checkpoint_path}")
                 
                 # Initialize tokenizer
                 if TOKENIZERS_AVAILABLE:
@@ -1367,8 +1369,17 @@ def _create_server_reward_function():
             # Generate unique request ID
             request_id = str(uuid.uuid4())
             
+            # Ensure spectrum_embed is a tensor (server expects tensors!)
+            if isinstance(spectrum_embed, torch.Tensor):
+                spectrum_embed_tensor = spectrum_embed.cpu()  # Move to CPU for serialization
+            elif isinstance(spectrum_embed, np.ndarray):
+                spectrum_embed_tensor = torch.from_numpy(spectrum_embed).float()
+            else:
+                # Convert other types to tensor
+                spectrum_embed_tensor = torch.tensor(spectrum_embed, dtype=torch.float32)
+            
             # Send request to server
-            request = (request_id, selfies_string, spectrum_embed.cpu(), formula_string)
+            request = (request_id, selfies_string, spectrum_embed_tensor, formula_string)
             _request_queue.put(request, timeout=_client_timeout)
             
             # Wait for response by polling the shared dictionary with adaptive intervals
@@ -1460,11 +1471,21 @@ def send_training_data_to_server(
         # Generate unique training request ID
         request_id = f"train_{str(uuid.uuid4())}"
         
-        # Prepare training data
+        # Prepare training data - ensure all spectrum embeds are tensors (server expects tensors!)
+        processed_spectrum_embeds = []
+        for embed in spectrum_embeds:
+            if isinstance(embed, torch.Tensor):
+                processed_spectrum_embeds.append(embed.cpu())  # Move to CPU for serialization
+            elif isinstance(embed, np.ndarray):
+                processed_spectrum_embeds.append(torch.from_numpy(embed).float())
+            else:
+                # Convert other types to tensor
+                processed_spectrum_embeds.append(torch.tensor(embed, dtype=torch.float32))
+        
         training_data = {
             'generated_selfies': generated_selfies,
             'ground_truth_selfies': ground_truth_selfies,
-            'spectrum_embeds': [embed.cpu() for embed in spectrum_embeds],  # Move to CPU for serialization
+            'spectrum_embeds': processed_spectrum_embeds,
         }
         
         if learning_rate is not None:

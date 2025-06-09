@@ -348,18 +348,17 @@ class MassSelfiesED(nn.Module):
         )
         last     = dec_out[:, -1, :]
 
-        # full logits & value
+        # full logits & value - logit index = token_id
         full_logits = self.action_head(last)  # (B, vocab_size)
         value       = self.value_head(last).squeeze(-1)
 
-        # mask special tokens
+        # Basic masking of special tokens at their token_id positions
         for sid in [self.pad_token_id, self.sos_token_id,
                     self.eos_token_id, self.unk_token_id]:
             full_logits[:, sid] = float('-1e3')
 
-        # slice to environment action space (71)
-        policy_logits = full_logits[:, self.action_token_ids]  # (B,71)
-        return policy_logits, value
+        # Return full vocabulary logits where logit index = token_id
+        return full_logits, value
 
 # -----------------------------------------------------------------------------
 # Greedy step prediction helper
@@ -369,7 +368,7 @@ def step_prediction(model: MassSelfiesED,
                    tokenizer: SelfiesTokenizer,
                    combined_vec: torch.Tensor,
                    device: Optional[str]=None):
-    """Single-step greedy prediction"""
+    """Single-step greedy prediction - logit index = token_id"""
     model.eval()
     dev = device or next(model.parameters()).device
     vec = combined_vec.to(dev)
@@ -383,15 +382,33 @@ def step_prediction(model: MassSelfiesED,
     # So we can use them directly without adding another SOS token
     ids = prefix_ids.to(dev)  # (B, T)
     mask = (ids != tokenizer.pad_token_id).to(dev)  # (B, T)
-    # forward
-    logits, value = model(vec, ids, mask)
-    next_id = torch.argmax(logits, dim=-1)[0].item()
+    
+    # forward - returns full vocabulary logits where index = token_id
+    full_logits, value = model(vec, ids, mask)  # (B, vocab_size)
+    
+    # Mask out non-action tokens, keeping only valid action tokens
+    global actions_list
+    if actions_list is None:
+        actions_list = get_actions_list()
+    
+    # Create action mask - only allow valid action tokens
+    action_mask = torch.full_like(full_logits[0], float('-1e9'), device=dev)
+    for action_token in actions_list:
+        token_id = tokenizer.token_to_id(action_token)
+        action_mask[token_id] = 0  # Allow this token
+    
+    # Apply action mask
+    masked_logits = full_logits + action_mask.unsqueeze(0)
+    
+    # Get the token ID with highest probability
+    next_token_id = torch.argmax(masked_logits, dim=-1)[0].item()
+    
     return {
-        'logits': logits.squeeze(0),
+        'logits': masked_logits.squeeze(0),  # Full vocabulary logits with action masking
         'value':  value, 
-        'probs':  F.softmax(logits, dim=-1).squeeze(0).cpu().numpy(),
+        'probs':  F.softmax(masked_logits, dim=-1).squeeze(0).cpu().numpy(),
         'current_prefix': ids[0].tolist(),
-        'next_token_id': next_id,
+        'next_token_id': next_token_id,  # The token ID (which equals the logit index)
     }
 
 # -----------------------------------------------------------------------------
@@ -439,7 +456,7 @@ class MuZeroSelfiesTransformer(nn.Module):
         
         pred = step_prediction(self.transformer, self.tok, combined_for_transformer, device=self.device)
         val = pred['value'].unsqueeze(-1).expand(B, 1)
-        pol = pred['logits']
+        pol = pred['logits']  # Full vocabulary logits with action masking
         rew = [0.0] * B
 
         return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=obs)
@@ -449,7 +466,7 @@ class MuZeroSelfiesTransformer(nn.Module):
         return observation
 
     def _dynamics(self, latent_state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Update latent state by replacing last padding token with action"""
+        """Update latent state by replacing last padding token with action (action = token_id)"""
         action = action.squeeze().float()
 
         # Ensure latent_state has batch dimension
@@ -477,9 +494,10 @@ class MuZeroSelfiesTransformer(nn.Module):
     def recurrent_inference(self, latent_state: torch.Tensor, action: torch.Tensor):
         """Perform recurrent inference step"""
         next_latent_state, reward = self._dynamics(latent_state, action)
-        # action is a tensor of shape (B, 1)
+        # action is a tensor containing token IDs directly
         # check if any of the actions is the end token
-        if (action == self.tok.end_token_id).any():
+        end_token_id = self.tok.token_to_id("<END>") if hasattr(self.tok, 'token_to_id') else self.tok.end_token_id
+        if (action == end_token_id).any():
             print("end token found in recurrent inference")
 
         # For base class, extract only spectrum and SELFIES parts for transformer
@@ -492,10 +510,25 @@ class MuZeroSelfiesTransformer(nn.Module):
         
         mask = (selfies_part_clamped != self.tok.pad_token_id) & (selfies_part_clamped != self.tok.end_token_id)
 
-        logits, value = self.transformer(spectrum, selfies_part_clamped, mask)
+        # Get full vocabulary logits
+        full_logits, value = self.transformer(spectrum, selfies_part_clamped, mask)
+        
+        # Apply action masking - mask out non-action tokens
+        global actions_list
+        if actions_list is None:
+            actions_list = get_actions_list()
+        
+        # Create action mask
+        action_mask = torch.full_like(full_logits, float('-1e9'), device=self.device)
+        for action_token in actions_list:
+            token_id = self.tok.token_to_id(action_token)
+            action_mask[:, token_id] = 0  # Allow this token
+        
+        # Apply mask
+        policy_logits = full_logits + action_mask
         value = value.unsqueeze(-1)
 
-        return MZNetworkOutput(value=value, reward=reward, policy_logits=logits, latent_state=next_latent_state)
+        return MZNetworkOutput(value=value, reward=reward, policy_logits=policy_logits, latent_state=next_latent_state)
 
     def _pad_batch_prefix(self, prefix_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L = prefix_ids.shape
@@ -770,18 +803,32 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                 
         return formula_strings
     
-    def _apply_formula_mask(self, logits: torch.Tensor, current_selfies_list: List[str], formula_list: List[str]) -> torch.Tensor:
-        """Apply formula-based action masking to logits"""
+    def _apply_formula_mask(self, full_logits: torch.Tensor, current_selfies_list: List[str], formula_list: List[str]) -> torch.Tensor:
+        """Apply formula-based action masking to full vocabulary logits at token_id positions"""
         # Check for NaN in input logits first
-        if torch.isnan(logits).any():
-            print(f"[WARN] NaN detected in input logits before masking")
-            logits = torch.where(torch.isnan(logits), torch.tensor(0.0, device=logits.device), logits)
+        if torch.isnan(full_logits).any():
+            print(f"[WARN] NaN detected in input full_logits before masking")
+            full_logits = torch.where(torch.isnan(full_logits), torch.tensor(0.0, device=full_logits.device), full_logits)
         
+        # Start with basic action masking - mask out non-action tokens
+        global actions_list
+        if actions_list is None:
+            actions_list = get_actions_list()
+        
+        # Create base action mask - allow only valid action tokens
+        action_mask = torch.full_like(full_logits, float('-1e9'), device=full_logits.device)
+        for action_token in actions_list:
+            token_id = self.tok.token_to_id(action_token)
+            action_mask[:, token_id] = 0  # Allow this token
+        
+        # Apply base action mask
+        masked_logits = full_logits + action_mask
+        
+        # Apply formula-based masking if available
         if not formula_list or not any(formula_list):
-            return logits
+            return masked_logits
             
-        masked_logits = logits.clone()
-        batch_size = logits.size(0)
+        batch_size = full_logits.size(0)
         
         for batch_idx in range(batch_size):
             current_selfies = current_selfies_list[batch_idx]
@@ -792,7 +839,7 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                 
             try:
                 # Get action mask using the utility function
-                action_mask = self.get_action_mask_from_selfies_string(
+                formula_action_mask = self.get_action_mask_from_selfies_string(
                     formula=target_formula,
                     current_selfies=current_selfies,
                     actions_list=actions_list,
@@ -805,27 +852,23 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                     min_formula_completion=self.min_formula_completion if self.prevent_early_termination else 0.0,
                     allow_early_end_after_steps=self.allow_early_end_after_steps if self.prevent_early_termination else 0
                 )
-                # available actions
-                # available_actions = [actions_list[i] for i in range(len(actions_list)) if action_mask[i]]
-                # print(f"debug: formula: {target_formula}\ncurrent selfies: {current_selfies}\ndebug: available actions: {available_actions}")
                 
-                mask_tensor = torch.tensor(action_mask, dtype=torch.bool, device=logits.device)
-                
-                # Use a safer masking approach
-                # Find the minimum logit value and subtract a reasonable amount
-                min_logit = masked_logits[batch_idx].min().item()
-                mask_value = min_logit - 1e3  # Subtract 10 from minimum to ensure masked actions have very low probability
-                
-                masked_logits[batch_idx][~mask_tensor] = mask_value
+                # Apply formula mask at token_id positions
+                for action_idx, is_allowed in enumerate(formula_action_mask):
+                    if not is_allowed:
+                        action_token = actions_list[action_idx]
+                        token_id = self.tok.token_to_id(action_token)
+                        # Mask out this token by setting a very negative value
+                        masked_logits[batch_idx, token_id] = float('-1e9')
                 
             except Exception as e:
                 print(f"[WARN] Failed to apply formula mask for batch {batch_idx}: {e}")
-                # Continue without masking for this batch
+                # Continue without formula masking for this batch
                 
         # Final check for NaN values
         if torch.isnan(masked_logits).any():
             print(f"[WARN] NaN detected in final masked_logits, replacing with safe values")
-            masked_logits = torch.where(torch.isnan(masked_logits), torch.tensor(-10.0, device=logits.device), masked_logits)
+            masked_logits = torch.where(torch.isnan(masked_logits), torch.tensor(-1e9, device=full_logits.device), masked_logits)
                 
         return masked_logits
     
@@ -894,28 +937,23 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         # Compute reward using global reward network only if action is end token
         if GLOBAL_REWARD_AVAILABLE and global_reward_network is not None:
             try:
-                # Get the actions list to check if action is end token
-                global actions_list
-                if actions_list is None:
-                    actions_list = get_actions_list()
+                # Get the token ID of the end token
+                end_token_id = self.tok.token_to_id("<END>") if hasattr(self.tok, 'token_to_id') else self.tok.end_token_id
                 
-                # Find the index of the end token in actions list
-                end_token_idx = actions_list.index("<END>") if "<END>" in actions_list else -1
-                
-                # Check if the current action is the end token
-                action_idx = action.squeeze().long()
-                if action_idx.dim() == 0:  # Single action
-                    action_idx = action_idx.unsqueeze(0)
+                # Check if the current action is the end token (action contains token IDs directly)
+                action_token_ids = action.squeeze().long()
+                if action_token_ids.dim() == 0:  # Single action
+                    action_token_ids = action_token_ids.unsqueeze(0)
                 
                 reward_function = global_reward_network.get_reward_function()
                 batch_size = next_latent_state.size(0)
                 reward_scores = []
                 
                 for batch_idx in range(batch_size):
-                    current_action = action_idx[batch_idx].item() if batch_idx < len(action_idx) else action_idx[0].item()
+                    current_token_id = action_token_ids[batch_idx].item() if batch_idx < len(action_token_ids) else action_token_ids[0].item()
                     
                     # Only use reward network if this is the end token action
-                    if current_action == end_token_idx:
+                    if current_token_id == end_token_id:
                         current_selfies = current_selfies_list[batch_idx]
                         formula = formula_list[batch_idx] if batch_idx < len(formula_list) else ""
                         spectrum_embed = next_latent_state[batch_idx, :self.spectrum_dim]
@@ -923,7 +961,6 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                         # Compute reward using the global reward network
                         similarity_score = reward_function(current_selfies, spectrum_embed, formula)
                         reward_scores.append(similarity_score)
-                        # print(f"debug: current_action: {current_action}, end_token_idx: {end_token_idx}, similarity_score: {similarity_score}")
                     else:
                         # For non-end actions, use zero reward
                         reward_scores.append(0.0)
@@ -955,18 +992,15 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         assert not torch.isnan(spectrum).any(), f"spectrum has nan: {spectrum}"
         assert not torch.isnan(selfies_ids_clamped).any(), f"selfies_ids_clamped has nan: {selfies_ids_clamped}"
         assert not torch.isnan(mask).any(), f"mask has nan: {mask}"
-        logits, value = self.transformer(spectrum, selfies_ids_clamped, mask)
-        assert not torch.isnan(logits).any(), f"logits has nan: {logits}"
+        
+        # Get full vocabulary logits
+        full_logits, value = self.transformer(spectrum, selfies_ids_clamped, mask)
+        assert not torch.isnan(full_logits).any(), f"full_logits has nan: {full_logits}"
 
-        # Apply formula-based action masking
-        masked_logits = self._apply_formula_mask(logits, current_selfies_list, formula_list)
+        # Apply formula-based action masking (includes basic action masking)
+        masked_logits = self._apply_formula_mask(full_logits, current_selfies_list, formula_list)
         value = value.unsqueeze(-1)
-        # print("debug: #########################")
-        # print("debug: current selfies: ", current_selfies_list[0])
-        # print("debug: formula: ", formula_list[0])
-        # for action in range(len(actions_list)):
-        #     print(f"debug: action: {actions_list[action]}, logit: {masked_logits[0, action]}")
-        # print("end of debug: #########################")
+        
         return MZNetworkOutput(
             value=value, 
             reward=reward, 
@@ -982,8 +1016,6 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
 
         # Extract formula from observation
         formula_list = self._extract_formula_from_latent_state(vec)
-        # if formula_list and formula_list[0]:
-        #     print(f"Using target formula from observation: '{formula_list[0]}'")
 
         # Get initial prediction - only use spectrum and SELFIES parts
         spectrum = vec[:, :self.spectrum_dim]
@@ -996,14 +1028,14 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         # Create mask for transformer
         mask = (selfies_part_clamped != self.tok.pad_token_id) & (selfies_part_clamped != self.tok.end_token_id)
         
-        # Use transformer directly for batch processing
-        logits, value = self.transformer(spectrum, selfies_part_clamped, mask)
+        # Use transformer directly for batch processing - get full vocabulary logits
+        full_logits, value = self.transformer(spectrum, selfies_part_clamped, mask)
         
         # Extract initial SELFIES (should be empty)
         current_selfies_list = self._extract_selfies_from_latent_state(vec)
         
-        # Apply formula masking to logits
-        masked_logits = self._apply_formula_mask(logits, current_selfies_list, formula_list)
+        # Apply formula masking to logits (includes basic action masking)
+        masked_logits = self._apply_formula_mask(full_logits, current_selfies_list, formula_list)
         
         val = value.unsqueeze(-1)
         pol = masked_logits

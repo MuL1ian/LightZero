@@ -15,12 +15,15 @@ from lzero.model import global_reward_network
 # Number of environments for training
 collector_env_num = 256
 evaluator_env_num = 256
+debug = False
+batch_size = 256
+max_moves = 80
 # NEW: Configure reward server for subprocess-based environments
 # The reward server runs in a dedicated process and handles batched reward computation
 # for all environment subprocesses, solving the multiprocessing limitations of the old system
 reward_server_config = {
     'use_reward_server': True,        # Enable reward server for subprocess environments
-    'batch_size': 256,                  # Batch size for reward server (smaller for responsiveness)
+    'batch_size': batch_size,                  # Batch size for reward server (smaller for responsiveness)
     'batch_timeout': 20.0,            # Timeout for batching (seconds)
     'client_timeout': 20.0,           # Timeout for client requests (auto-calculated if None: min(60.0, max(5.0, batch_timeout * 10 + 5)))
     'enable_batched_rewards': False,  # Disable old batching system
@@ -68,7 +71,7 @@ massgym_batched_config = dict(
         env_id='mass_spec_env',
         
         # Basic environment settings
-        max_episode_steps=100,
+        max_episode_steps=max_moves,
         obs_type='fingerprint',
         reward_type='cosine_similarity',
         reward_normalize=False,
@@ -85,7 +88,7 @@ massgym_batched_config = dict(
         # SELFIES and formula settings
         max_len=100,
         formula_masking=True,
-        formula_max_len=60,
+        formula_max_len=50,  # Fixed: match model config
         
         # Rendering settings
         render_mode=None,
@@ -99,7 +102,7 @@ massgym_batched_config = dict(
         **reward_server_config,  # Use the new reward server configuration
         
         # Path to reward network checkpoint (update this path as needed)
-        reward_network_checkpoint='reward_model/diffms/models/reward_model/best_model.pt',
+        reward_network_checkpoint='reward_model/diffms/models/reward_model_enhanced/best_model.pt',
         
         # Environment creation settings
         # collector_env_num=collector_env_num,
@@ -108,8 +111,8 @@ massgym_batched_config = dict(
         stop_value=1e6,
         
         # Debug settings
-        debug=False,  # Set to True for smaller dataset
-        use_filter=True,
+        debug=debug,  # Set to True for smaller dataset
+        use_filter=not debug,
         filter_len=75,
     ),
     
@@ -136,8 +139,8 @@ massgym_batched_config = dict(
         
         # Model settings
         model=dict(
-            observation_shape=4256,  # 4096 (spectrum) + 100 (SELFIES max_len) + 60 (formula_max_len)
-            action_space_size=69,    # Fixed: set to actual action space size (will be updated by environment)
+            observation_shape=4246,  # 4096 (spectrum) + 100 (SELFIES max_len) + 50 (formula_max_len)
+            action_space_size=75,    # Updated to match vocabulary size (includes all tokens)
             model_type='mlp',
             categorical_distribution=False,
             latent_state_dim=512,
@@ -145,7 +148,7 @@ massgym_batched_config = dict(
             self_supervised_learning_loss=False,
             use_transformer=True,
             pretrained_transformer_path="pretrained_selfies_transformer/best_model.pt",
-            formula_max_len=60,  # Ensure model matches environment observation structure
+            formula_max_len=50,  # Ensure model matches environment observation structure
             load_pretrained_transformer=True,
         ),
         
@@ -159,12 +162,12 @@ massgym_batched_config = dict(
         # MCTS settings
         mcts_ctree=True,
         simulation_num=32,
-        batch_size=256,
+        batch_size=batch_size,
         
         # Training settings
-        learning_rate=1e-5,
+        learning_rate=1e-4,
         num_simulations=32,
-        max_moves=100,
+        max_moves=max_moves,
         update_per_collect=1,
         optim_type='Adam',
         
@@ -174,11 +177,11 @@ massgym_batched_config = dict(
         ssl_loss_weight=2,
         reanalyze_ratio=0.0,
         n_episode=collector_env_num,
-        eval_freq=int(2e2),
-        replay_buffer_size=int(2e3),
+        eval_freq=int(50),
+        replay_buffer_size=int(1e2),
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
-        discount_factor=1.0,
+        discount_factor=0.99,
         # Reward network integration
         use_reward_network=True,
         reward_network_checkpoint='reward_model/diffms/models/reward_model/best_model.pt',
@@ -200,8 +203,12 @@ massgym_batched_config = dict(
         # Server-based reward network training configuration  
         reward_network_learning_rate=1e-4,
         reward_network_weight_decay=1e-4,
-        training_batch_size=256,
+        training_batch_size=batch_size,
         training_timeout=10.0,
+        
+        # Ground-truth trajectory injection settings
+        gt_trajectory_injection_enabled=True,
+        target_gt_ratio=0.3,  # Target 30% ground-truth trajectories in replay buffer
     ),
     
     # Weights & Biases logger configuration
@@ -217,7 +224,7 @@ massgym_batched_config = dict(
     seed=0,
     
     # Collection configuration
-    collection_steps_per_iter=int(1024/collector_env_num),  # Number of data collection steps per training iteration
+    collection_steps_per_iter=1,  # Number of data collection steps per training iteration
 
     # Collector settings
     collector=dict(
@@ -234,8 +241,8 @@ massgym_batched_config = dict(
     
     # Replay buffer settings
     replay_buffer=dict(
-        replay_buffer_size=int(2e3),
-        batch_size=256,
+        replay_buffer_size=int(5e5),
+        batch_size=batch_size,
     ),
 )
 

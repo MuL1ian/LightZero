@@ -799,7 +799,7 @@ class MassGymEnv(gym.Env):
         self.remove_token = "<REMOVE>"
         self.end_token = "<END>"
 
-                # 记录tokenizer的special tokens但不作为action
+                # Record tokenizer special tokens
         self.tokenizer_special_tokens = [
                 self.tokenizer.pad_token,
                 self.tokenizer.sos_token,
@@ -807,13 +807,21 @@ class MassGymEnv(gym.Env):
                 self.tokenizer.unk_token
         ]
         
-        # combine all possible actions (不包含special tokens)
+        # Include ALL tokens (including special tokens and hydrogen) to match vocabulary size
+        # This ensures action space size = vocabulary size = 75
+        # Add [H] explicitly since it may be filtered out but is in the vocabulary
+        additional_tokens = []
+        if '[H]' not in self.atom_tokens and '[H]' in self.tokenizer.get_vocab():
+            additional_tokens.append('[H]')
+            
         self.actions_list = (self.atom_tokens + 
                             self.bonded_atom_tokens +
                             self.branch_tokens + 
                             self.ring_tokens + 
-                            [self.end_token]
-                            # [self.remove_token, self.end_token]
+                            [self.end_token] +
+                            [self.remove_token] +
+                            self.tokenizer_special_tokens +
+                            additional_tokens
                             )
         
         vocab = self.tokenizer.get_vocab()
@@ -1083,7 +1091,13 @@ class MassGymEnv(gym.Env):
         if self.episode_length >= self.max_episode_steps:
             print("debug: episode length >= max_episode_steps")
             done = True
-        if action_name == self.remove_token:
+            
+        # Handle special tokens (should not be executed as actions)
+        if action_name in self.tokenizer_special_tokens:
+            # Special tokens are invalid actions during gameplay
+            raw_reward = -0.5
+            print(f"[WARN] Invalid special token action attempted: {action_name}")
+        elif action_name == self.remove_token:
             if len(self.bond_counts) == 0:
                 raw_reward = -0.5  # Can't remove from empty molecule
             else:

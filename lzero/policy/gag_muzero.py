@@ -471,6 +471,7 @@ class GAGMuZeroPolicy(GumbelMuZeroPolicy):
         Overview:
             Compute pairwise preference loss (similar to RLHF).
             Encourages positive instances to have higher rewards than negative instances.
+            Uses element-wise comparison between corresponding positive and negative pairs.
             
         Arguments:
             - positive_rewards: Rewards for positive (ground-truth) instances
@@ -483,27 +484,27 @@ class GAGMuZeroPolicy(GumbelMuZeroPolicy):
             return torch.tensor(0.0, device=self._cfg.device)
         
         try:
+            # Ensure we have the same number of positive and negative rewards for pairwise comparison
+            min_length = min(len(positive_rewards), len(negative_rewards))
+            if min_length == 0:
+                return torch.tensor(0.0, device=self._cfg.device)
+            
+            # Truncate to same length for element-wise comparison
+            pos_rewards = positive_rewards[:min_length]
+            neg_rewards = negative_rewards[:min_length]
+            
             # Normalize rewards if configured
             if self._cfg.normalize_rewards:
-                all_rewards = torch.cat([positive_rewards, negative_rewards])
+                all_rewards = torch.cat([pos_rewards, neg_rewards])
                 reward_mean = torch.mean(all_rewards)
                 reward_std = torch.std(all_rewards) + 1e-8
                 
-                positive_rewards = (positive_rewards - reward_mean) / reward_std * self._cfg.reward_norm_scale
-                negative_rewards = (negative_rewards - reward_mean) / reward_std * self._cfg.reward_norm_scale
+                pos_rewards = (pos_rewards - reward_mean) / reward_std * self._cfg.reward_norm_scale
+                neg_rewards = (neg_rewards - reward_mean) / reward_std * self._cfg.reward_norm_scale
             
-            # Create pairwise comparisons
-            # For each positive reward, compare with all negative rewards
-            num_positive = len(positive_rewards)
-            num_negative = len(negative_rewards)
-            
-            # Expand dimensions for pairwise comparison
-            pos_expanded = positive_rewards.unsqueeze(1).expand(num_positive, num_negative)  # [num_pos, num_neg]
-            neg_expanded = negative_rewards.unsqueeze(0).expand(num_positive, num_negative)  # [num_pos, num_neg]
-            
+            # Element-wise preference comparison (no cross-comparison)
             # Compute preference logits (positive should be preferred over negative)
-            # logits = (r_pos - r_neg) / temperature
-            preference_logits = (pos_expanded - neg_expanded) / self._cfg.preference_temperature
+            preference_logits = (pos_rewards - neg_rewards) / self._cfg.preference_temperature
             
             # Target: positive instances should be preferred (label = 1)
             targets = torch.ones_like(preference_logits)
@@ -548,6 +549,7 @@ class GAGMuZeroPolicy(GumbelMuZeroPolicy):
         """
         Overview:
             Compute accuracy metric: fraction of cases where positive reward > negative reward.
+            Uses element-wise comparison between corresponding positive and negative pairs.
             
         Arguments:
             - positive_rewards: Rewards for positive instances
@@ -560,15 +562,17 @@ class GAGMuZeroPolicy(GumbelMuZeroPolicy):
             return 0.0
         
         try:
-            # Compute pairwise comparisons
-            num_positive = len(positive_rewards)
-            num_negative = len(negative_rewards)
+            # Ensure we have the same number of rewards for element-wise comparison
+            min_length = min(len(positive_rewards), len(negative_rewards))
+            if min_length == 0:
+                return 0.0
             
-            pos_expanded = positive_rewards.unsqueeze(1).expand(num_positive, num_negative)
-            neg_expanded = negative_rewards.unsqueeze(0).expand(num_positive, num_negative)
+            # Truncate to same length for element-wise comparison
+            pos_rewards = positive_rewards[:min_length]
+            neg_rewards = negative_rewards[:min_length]
             
-            # Count cases where positive > negative
-            correct_preferences = (pos_expanded > neg_expanded).float()
+            # Element-wise comparison: count cases where positive > negative
+            correct_preferences = (pos_rewards > neg_rewards).float()
             accuracy = torch.mean(correct_preferences)
             
             return float(accuracy.item())
@@ -585,11 +589,13 @@ class GAGMuZeroPolicy(GumbelMuZeroPolicy):
         target_update_period: int,
         target_update_period_ratio: float,
         collector_env_num: int,
-        collected_data_pairs: Optional[List] = None
+        collected_data_pairs: Optional[List] = None,
+        ground_truth_trajectories: Optional[List] = None
     ) -> Dict[str, Union[float, int]]:
         """
         Overview:
-            Learn function that includes GAG adversarial training using server-based reward network training.
+            Learn function that includes GAG adversarial training using server-based reward network training
+            and ground-truth trajectory integration.
         """
         # Call parent learn method to get base training results
         base_info = super().learn(data, optimizer, lr_scheduler, target_update_period, target_update_period_ratio, collector_env_num)
@@ -666,6 +672,11 @@ class GAGMuZeroPolicy(GumbelMuZeroPolicy):
                             'reward_network_lr': training_result.get('learning_rate', self._cfg.reward_network_learning_rate),
                             'reward_network_wd': training_result.get('weight_decay', self._cfg.reward_network_weight_decay),
                         })
+                        
+                        # Add ground-truth trajectory metrics if available
+                        if ground_truth_trajectories and len(ground_truth_trajectories) > 0:
+                            gt_stats = self._compute_ground_truth_trajectory_stats(ground_truth_trajectories)
+                            base_info.update(gt_stats)
                         
                         print(f"[INFO] GAG MuZero server training successful: "
                               f"Adversarial Loss: {adversarial_loss:.4f}, "
@@ -818,6 +829,13 @@ class GAGMuZeroPolicy(GumbelMuZeroPolicy):
             'mean_positive_reward',
             'mean_negative_reward',
             'server_training_status',
+            'gt_trajectory_count',
+            'gt_avg_final_reward',
+            'gt_avg_discounted_return',
+            'gt_avg_trajectory_length',
+            'gt_min_final_reward',
+            'gt_max_final_reward',
+            'gt_trajectories_with_positive_reward',
         ]
         
         return base_vars + gag_vars
@@ -858,3 +876,53 @@ class GAGMuZeroPolicy(GumbelMuZeroPolicy):
         except Exception as e:
             print(f"[WARN] GAG MuZero: Error computing GAG reward accuracy: {e}")
             return 0.0
+    
+    def _compute_ground_truth_trajectory_stats(self, ground_truth_trajectories: List) -> Dict[str, float]:
+        """
+        Compute statistics for ground-truth trajectories.
+        
+        Args:
+            ground_truth_trajectories: List of ground-truth trajectory data
+            
+        Returns:
+            stats: Dictionary of trajectory statistics
+        """
+        try:
+            if not ground_truth_trajectories:
+                return {
+                    'gt_trajectory_count': 0,
+                    'gt_avg_final_reward': 0.0,
+                    'gt_avg_discounted_return': 0.0,
+                    'gt_avg_trajectory_length': 0.0,
+                    'gt_min_final_reward': 0.0,
+                    'gt_max_final_reward': 0.0,
+                    'gt_trajectories_with_positive_reward': 0,
+                }
+            
+            final_rewards = [t.get('final_reward', 0.0) for t in ground_truth_trajectories]
+            discounted_returns = [t.get('discounted_return', 0.0) for t in ground_truth_trajectories]
+            trajectory_lengths = [t.get('trajectory_length', 0) for t in ground_truth_trajectories]
+            
+            stats = {
+                'gt_trajectory_count': len(ground_truth_trajectories),
+                'gt_avg_final_reward': sum(final_rewards) / len(final_rewards) if final_rewards else 0.0,
+                'gt_avg_discounted_return': sum(discounted_returns) / len(discounted_returns) if discounted_returns else 0.0,
+                'gt_avg_trajectory_length': sum(trajectory_lengths) / len(trajectory_lengths) if trajectory_lengths else 0.0,
+                'gt_min_final_reward': min(final_rewards) if final_rewards else 0.0,
+                'gt_max_final_reward': max(final_rewards) if final_rewards else 0.0,
+                'gt_trajectories_with_positive_reward': sum(1 for r in final_rewards if r > 0),
+            }
+            
+            return stats
+            
+        except Exception as e:
+            print(f"[WARN] GAG MuZero: Error computing ground-truth trajectory stats: {e}")
+            return {
+                'gt_trajectory_count': 0,
+                'gt_avg_final_reward': 0.0,
+                'gt_avg_discounted_return': 0.0,
+                'gt_avg_trajectory_length': 0.0,
+                'gt_min_final_reward': 0.0,
+                'gt_max_final_reward': 0.0,
+                'gt_trajectories_with_positive_reward': 0,
+            }

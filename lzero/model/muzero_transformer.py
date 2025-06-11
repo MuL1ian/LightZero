@@ -236,6 +236,7 @@ class MassSelfiesED(nn.Module):
         n_dec=6,
         n_head=8,
         dropout=0.1,
+        n_spectrum_heads=32,
         device="cuda",
     ):
         super().__init__()
@@ -255,10 +256,27 @@ class MassSelfiesED(nn.Module):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.unk_token_id = self.tokenizer.unk_token_id
 
-        # Encoder for spectrum
+        # Enhanced Encoder for spectrum with multi-head self-attention
+        self.n_spectrum_heads = n_spectrum_heads 
+        assert d_model % self.n_spectrum_heads == 0, f"d_model {d_model} must be divisible by n_spectrum_heads {self.n_spectrum_heads}"
+        self.spectrum_head_dim = d_model // self.n_spectrum_heads
+        
+        # Project spectrum to multi-head format
         self.spec_proj = nn.Sequential(
-            nn.Linear(self.spectrum_dim, d_model), nn.ReLU(), nn.Dropout(dropout)
+            nn.Linear(self.spectrum_dim, d_model * self.n_spectrum_heads),
+            nn.ReLU(),
+            nn.Dropout(dropout)
         )
+        
+        # Spectrum self-attention layer
+        self.spectrum_self_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_head,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Spectrum encoder layers
         enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head,
                                                dropout=dropout, batch_first=True)
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_enc)
@@ -300,9 +318,20 @@ class MassSelfiesED(nn.Module):
         tgt_mask = tgt_mask.to(self.device)
         B, T = tgt_tokens.shape
 
-        # Encoder
-        enc_feat = self.spec_proj(spectrum_embed)       # (B, d_model)
-        mem = self.encoder(enc_feat.unsqueeze(1))       # (B, 1, d_model)
+        # Enhanced Encoder with multi-head spectrum processing
+        # Project spectrum to multi-head format
+        spec_projected = self.spec_proj(spectrum_embed)  # (B, d_model * n_spectrum_heads)
+        
+        # Reshape to multi-head format
+        spec_multihead = spec_projected.view(B, self.n_spectrum_heads, -1)  # (B, n_spectrum_heads, d_model)
+        
+        # Apply self-attention across spectrum heads
+        spec_attended, _ = self.spectrum_self_attn(
+            spec_multihead, spec_multihead, spec_multihead
+        )  # (B, n_spectrum_heads, d_model)
+        
+        # Use the attended spectrum as memory for decoder
+        mem = self.encoder(spec_attended)  # (B, n_spectrum_heads, d_model)
 
         # Decoder
         pos_ids = torch.arange(T, device=self.device).unsqueeze(0).expand(B, -1)
@@ -333,9 +362,20 @@ class MassSelfiesED(nn.Module):
         tgt_mask   = tgt_mask.to(self.device)
         B, T = tgt_tokens.shape
 
-        # Encoder
-        enc_feat = self.spec_proj(spectrum_embed)       # (B,d)
-        mem      = self.encoder(enc_feat.unsqueeze(1))  # (B,1,d)
+        # Enhanced Encoder with multi-head spectrum processing
+        # Project spectrum to multi-head format
+        spec_projected = self.spec_proj(spectrum_embed)  # (B, d_model * n_spectrum_heads)
+        
+        # Reshape to multi-head format
+        spec_multihead = spec_projected.view(B, self.n_spectrum_heads, -1)  # (B, n_spectrum_heads, d_model)
+        
+        # Apply self-attention across spectrum heads
+        spec_attended, _ = self.spectrum_self_attn(
+            spec_multihead, spec_multihead, spec_multihead
+        )  # (B, n_spectrum_heads, d_model)
+        
+        # Use the attended spectrum as memory for decoder
+        mem = self.encoder(spec_attended)  # (B, n_spectrum_heads, d_model)
 
         # Decoder
         pos_ids  = torch.arange(T, device=self.device).unsqueeze(0)
@@ -348,17 +388,18 @@ class MassSelfiesED(nn.Module):
         )
         last     = dec_out[:, -1, :]
 
-        # full logits & value - logit index = token_id
+        # full logits & value
         full_logits = self.action_head(last)  # (B, vocab_size)
         value       = self.value_head(last).squeeze(-1)
 
-        # Basic masking of special tokens at their token_id positions
+        # mask special tokens
         for sid in [self.pad_token_id, self.sos_token_id,
                     self.eos_token_id, self.unk_token_id]:
-            full_logits[:, sid] = float('-1e3')
+            full_logits[:, sid] = float('-1e9')
 
-        # Return full vocabulary logits where logit index = token_id
-        return full_logits, value
+        # slice to environment action space (71)
+        policy_logits = full_logits[:, self.action_token_ids]  # (B,71)
+        return policy_logits, value
 
 # -----------------------------------------------------------------------------
 # Greedy step prediction helper

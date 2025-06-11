@@ -27,17 +27,13 @@ class SpecialTokensBaseTokenizer(BaseTokenizer):
         self.eos_token = EOS_TOKEN
         self.unk_token = UNK_TOKEN
         self.max_length = max_len
-        # Ensure REMOVE and END are in vocab
-        self._tokenizer.add_tokens(["<REMOVE>", "<END>"])
-        # Add special tokens
+        # Add special tokens and deleted the remove and end token
         self.add_special_tokens([self.pad_token, self.sos_token, self.eos_token, self.unk_token])
         # Record token IDs
         self.pad_token_id = self.token_to_id(self.pad_token)
         self.sos_token_id = self.token_to_id(self.sos_token)
         self.eos_token_id = self.token_to_id(self.eos_token)
         self.unk_token_id = self.token_to_id(self.unk_token)
-        self.remove_token_id = self.token_to_id("<REMOVE>")
-        self.end_token_id    = self.token_to_id("<END>")
         # Enable padding and truncation
         self.enable_padding(direction="right", pad_token=self.pad_token, pad_id=self.pad_token_id, length=max_len)
         self.enable_truncation(max_len)
@@ -51,6 +47,11 @@ class SpecialTokensBaseTokenizer(BaseTokenizer):
 class SelfiesTokenizer(SpecialTokensBaseTokenizer):
     def __init__(self, max_len: int):
         alphabet = list(sorted(sf.get_semantic_robust_alphabet()))
+        # Add additional tokens for better performance
+        additional_tokens = ['[C@H1]', '[C@@H1]', '[/C]', r'[\C]','[C@@]', '[C@]'] # adding the 4 common token that not in the alphabet before 
+        alphabet.extend(additional_tokens)
+        alphabet = list(sorted(alphabet))
+        
         vocab = {symbol: i for i, symbol in enumerate(alphabet)}
         vocab[UNK_TOKEN] = len(vocab)
         tokenizer = Tokenizer(models.WordLevel(vocab=vocab, unk_token=UNK_TOKEN))
@@ -73,3 +74,9 @@ def pad_to_maxlen(ids: List[int], max_len: int, pad_id: int) -> Tuple[torch.Tens
     padded = ids + [pad_id] * (max_len - len(ids))
     mask   = [1] * len(ids) + [0] * (max_len - len(ids))
     return torch.tensor(padded, dtype=torch.long), torch.tensor(mask, dtype=torch.bool) 
+
+if __name__ == "__main__":
+    tokenizer = SelfiesTokenizer(max_len=100)
+    print(tokenizer.get_vocab())
+    print(len(tokenizer.get_vocab()))
+    # print(len(sf.get_semantic_robust_alphabet()))

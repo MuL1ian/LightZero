@@ -174,13 +174,14 @@ def create_model(config: PretrainConfig) -> MassSelfiesED:
     return MassSelfiesED(
         vocab_size=config.vocab_size,
         max_len=config.max_len,
-        d_model=config.d_model,
-        n_enc=config.n_enc,
+        d_model=config.d_model,  # Use d_model to match both config and MassSelfiesED class
         n_dec=config.n_dec,
         n_head=config.n_head,
+        num_projectors=config.num_projectors,
+        spectrum_chunk_size=config.spectrum_chunk_size,
         dropout=config.dropout,
-        n_spectrum_heads=config.n_spectrum_heads,
         device=config.device
+        # Note: num_projectors and spectrum_chunk_size use default values in MassSelfiesED
     )
 
 
@@ -780,7 +781,7 @@ def evaluate_on_test_set(model: MassSelfiesED, config: PretrainConfig, test_data
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pretrain SELFIES Transformer")
-    parser.add_argument("--load_checkpoint", type=str, help="Path to checkpoint to load", default="/hy-tmp/MCTS/MassEnv/main/LightZero/lzero/model/pretrain/pretrained_selfies_transformer/best_model.pt")
+    parser.add_argument("--load_checkpoint", type=str, help="Path to checkpoint to load")
     parser.add_argument("--eval_on_test", action="store_true", help="Evaluate on test set")
     parser.add_argument("--test_generation", action="store_true", help="Test generation capabilities")
     parser.add_argument("--test_data_path", type=str, default="/hy-tmp/MCTS/MassEnv/DataLoader/test_spectrum_embeds_msg.pt", 
@@ -807,12 +808,6 @@ if __name__ == "__main__":
     else:
         # Normal pretraining
         config = PretrainConfig(
-            batch_size=32,
-            learning_rate=5e-5,
-            num_epochs=30,
-            max_len=120,
-            d_model=512,
-            n_spectrum_heads=32,
             save_dir="./pretrained_selfies_transformer"
         )
         

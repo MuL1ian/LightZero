@@ -225,25 +225,28 @@ class ChemicalFormulaTokenizer:
 
 # -----------------------------------------------------------------------------
 # Encoder-Decoder Transformer
+# Now is decoder only Transformer (06 12 2025)
 # -----------------------------------------------------------------------------
 class MassSelfiesED(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        max_len: int = 128,
-        d_model=512,
-        n_enc=4,
-        n_dec=6,
-        n_head=8,
+        max_len: int = 120,
+        n_dec=12, 
+        n_head=16,
         dropout=0.1,
-        n_spectrum_heads=32,
+        embed_dim=128,
         device="cuda",
     ):
         super().__init__()
         self.device = torch.device(device)
         self.spectrum_dim = 4096
+        self.embed_dim = embed_dim
+        self.chunk_size = embed_dim
+
         # tokenizer for special ids and pad
         self.tokenizer = SelfiesTokenizer(max_len=max_len)
+
         # compute action_token_ids from global actions_list
         global actions_list
         if actions_list is None:
@@ -256,45 +259,71 @@ class MassSelfiesED(nn.Module):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.unk_token_id = self.tokenizer.unk_token_id
 
-        # Enhanced Encoder for spectrum with multi-head self-attention
-        self.n_spectrum_heads = n_spectrum_heads 
-        assert d_model % self.n_spectrum_heads == 0, f"d_model {d_model} must be divisible by n_spectrum_heads {self.n_spectrum_heads}"
-        self.spectrum_head_dim = d_model // self.n_spectrum_heads
-        
-        # Project spectrum to multi-head format
-        self.spec_proj = nn.Sequential(
-            nn.Linear(self.spectrum_dim, d_model * self.n_spectrum_heads),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Spectrum self-attention layer
-        self.spectrum_self_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_head,
+        # Token embeddings for SELFIES
+        self.token_embed = nn.Embedding(vocab_size, self.embed_dim)
+        self.pos_embed   = nn.Embedding(max_len, self.embed_dim)
+
+
+        # Multi-head self-attention for spectrum decomposition
+        self.spectrum_heads = self.spectrum_dim // self.embed_dim  
+
+        self.spectrum_decomposer = nn.MultiheadAttention(
+            embed_dim=self.chunk_size,
+            num_heads=min(self.spectrum_heads, self.chunk_size // 64),
             dropout=dropout,
             batch_first=True
         )
-        
-        # Spectrum encoder layers
-        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head,
-                                               dropout=dropout, batch_first=True)
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_enc)
 
-        # Decoder
-        self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed   = nn.Embedding(max_len, d_model)
-        dec_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=n_head,
-                                               dropout=dropout, batch_first=True)
+        # # Spectrum encoder layers
+        # enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head,
+        #                                        dropout=dropout, batch_first=True)
+        # self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_enc)
+        
+        # Decoder Only
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=self.embed_dim,  
+            nhead=n_head,
+            dropout=dropout, 
+            batch_first=True
+        )
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_dec)
 
-        # Heads
-        self.action_head = nn.Linear(d_model, vocab_size, bias=False)
-        self.value_head  = nn.Sequential(nn.Linear(d_model, d_model), nn.Tanh(), nn.Linear(d_model, 1))
+        # Outputs Heads
+        self.action_head = nn.Linear(self.embed_dim, vocab_size, bias=False)
+        self.value_head = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim), 
+            nn.Tanh(), 
+            nn.Linear(self.embed_dim, 1)
+        )
         self.to(self.device)
 
     def _generate_square_subsequent_mask(self, sz: int) -> torch.Tensor:
         return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
+
+    def _prepare_spectrum_memory(self, spectrum_embed: torch.Tensor) -> torch.Tensor:
+        """
+        Spectrum embedding is decomposed into chunks and self-attention is applied to each chunk.
+        
+        Args:
+            spectrum_embed: (B, spectrum_dim) spectrum embedding
+            
+        Returns:
+            torch.Tensor: (B, spectrum_heads, embed_dim) spectrum memory
+        """
+        batch_size = spectrum_embed.size(0)
+        
+        # Decompose spectrum into chunks: [batch_size, spectrum_heads, chunk_size]
+        spectrum_sequence = spectrum_embed.view(batch_size, self.spectrum_heads, self.chunk_size)
+        
+        # Apply multi-head self-attention to spectrum chunks
+        # This allows different chunks to interact with each other, creating a richer representation
+        spectrum_attended, _ = self.spectrum_decomposer(
+            query=spectrum_sequence,
+            key=spectrum_sequence, 
+            value=spectrum_sequence
+        )  # [batch_size, spectrum_heads, embed_dim]
+        
+        return spectrum_attended
 
     def forward_pretrain(
         self,
@@ -303,35 +332,23 @@ class MassSelfiesED(nn.Module):
         tgt_mask: torch.Tensor
     ) -> torch.Tensor:
         """
-        前向传播用于预训练 - 返回完整序列的logits
+        forward for logits
         
         Args:
-            spectrum_embed: (B, spectrum_dim) 质谱嵌入
-            tgt_tokens: (B, T) 目标token序列
+            spectrum_embed: (B, spectrum_dim) fingerprint 4096
+            tgt_tokens: (B, T) tgt selfies tokens
             tgt_mask: (B, T) attention mask
             
         Returns:
-            torch.Tensor: (B, T, vocab_size) 每个位置的logits
+            torch.Tensor: (B, T, vocab_size) logits for each position
         """
         spectrum_embed = spectrum_embed.to(self.device)
         tgt_tokens = tgt_tokens.long().to(self.device)
         tgt_mask = tgt_mask.to(self.device)
         B, T = tgt_tokens.shape
 
-        # Enhanced Encoder with multi-head spectrum processing
-        # Project spectrum to multi-head format
-        spec_projected = self.spec_proj(spectrum_embed)  # (B, d_model * n_spectrum_heads)
-        
-        # Reshape to multi-head format
-        spec_multihead = spec_projected.view(B, self.n_spectrum_heads, -1)  # (B, n_spectrum_heads, d_model)
-        
-        # Apply self-attention across spectrum heads
-        spec_attended, _ = self.spectrum_self_attn(
-            spec_multihead, spec_multihead, spec_multihead
-        )  # (B, n_spectrum_heads, d_model)
-        
-        # Use the attended spectrum as memory for decoder
-        mem = self.encoder(spec_attended)  # (B, n_spectrum_heads, d_model)
+        spectrum_memory = self._prepare_spectrum_memory(spectrum_embed)  # (B, spectrum_heads, embed_dim)
+        memory = spectrum_memory  # (B, spectrum_heads, embed_dim)
 
         # Decoder
         pos_ids = torch.arange(T, device=self.device).unsqueeze(0).expand(B, -1)
@@ -340,12 +357,12 @@ class MassSelfiesED(nn.Module):
         
         dec_out = self.decoder(
             tgt=dec_in, 
-            memory=mem,
+            memory=memory,
             tgt_mask=causal,
             tgt_key_padding_mask=(tgt_mask == 0)
-        )  # (B, T, d_model)
+        )  # (B, T, embed_dim)
 
-        # 获取每个位置的logits
+
         logits = self.action_head(dec_out)  # (B, T, vocab_size)
         
         return logits
@@ -362,27 +379,16 @@ class MassSelfiesED(nn.Module):
         tgt_mask   = tgt_mask.to(self.device)
         B, T = tgt_tokens.shape
 
-        # Enhanced Encoder with multi-head spectrum processing
-        # Project spectrum to multi-head format
-        spec_projected = self.spec_proj(spectrum_embed)  # (B, d_model * n_spectrum_heads)
+        spectrum_memory = self._prepare_spectrum_memory(spectrum_embed)  # (B, spectrum_heads, embed_dim)
         
-        # Reshape to multi-head format
-        spec_multihead = spec_projected.view(B, self.n_spectrum_heads, -1)  # (B, n_spectrum_heads, d_model)
-        
-        # Apply self-attention across spectrum heads
-        spec_attended, _ = self.spectrum_self_attn(
-            spec_multihead, spec_multihead, spec_multihead
-        )  # (B, n_spectrum_heads, d_model)
-        
-        # Use the attended spectrum as memory for decoder
-        mem = self.encoder(spec_attended)  # (B, n_spectrum_heads, d_model)
+        memory = spectrum_memory  # (B, spectrum_heads, embed_dim)
 
         # Decoder
         pos_ids  = torch.arange(T, device=self.device).unsqueeze(0)
         dec_in   = self.token_embed(tgt_tokens) + self.pos_embed(pos_ids)
         causal   = self._generate_square_subsequent_mask(T).to(self.device)
         dec_out  = self.decoder(
-            tgt=dec_in, memory=mem,
+            tgt=dec_in, memory=memory,
             tgt_mask=causal,
             tgt_key_padding_mask=(tgt_mask==0)
         )

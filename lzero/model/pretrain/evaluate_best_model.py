@@ -9,9 +9,8 @@ from tqdm import tqdm
 from collections import Counter, defaultdict
 from datetime import datetime
 import argparse
-from lzero.model.pretrain_transformer import load_pretrained_model, RealSpectrumSelfiesDataset
 from lzero.model.selfies_tokenizer import SelfiesTokenizer
-
+from lzero.model.pretrain.run_pretrain import RealSpectrumSelfiesDataset, load_pretrained_model
 
 def analyze_selfies_lengths(test_data_file, tokenizer):
     print(f"original data file: {test_data_file}")
@@ -95,11 +94,11 @@ def analyze_selfies_lengths(test_data_file, tokenizer):
             'token_std': selfies_token_counts.std(),
         }
     }
+    
 
 
 def generate_selfies_batch_greedy(model, spectrums, tokenizer, config, device, max_len=None, k_predictions=1, temperature=1.0):
     """Batch generation of SELFIES sequences with k predictions and temperature sampling"""
-    # Use config.max_len if max_len not specified
     if max_len is None:
         max_len = config.max_len
         
@@ -205,6 +204,7 @@ def evaluate_selfies_exact_match(model, config, test_data_file, device, batch_si
     
     total_samples = 0
     exact_matches = 0
+    chemical_equivalents = 0  # 添加化学等价性统计
     partial_matches = 0
     generation_failures = 0
     
@@ -234,30 +234,35 @@ def evaluate_selfies_exact_match(model, config, test_data_file, device, batch_si
                     generated_selfies_candidates = generated_selfies_multi_k[i]
                     
                     is_exact_match = False
+                    is_chemically_equivalent = False
                     is_partial_match = False
                     best_candidate_selfies = ""
+                    best_similarity_score = 0.0
                     
+                    # 检查所有候选结果，找到最好的匹配
                     for gen_selfies in generated_selfies_candidates:
-                        if gen_selfies == target_selfies:
+                        exact_match, chem_equiv, partial_match, similarity = check_selfies_correctness(target_selfies, gen_selfies)
+                        
+                        if exact_match:
                             is_exact_match = True
+                            is_chemically_equivalent = True
+                            is_partial_match = True
                             best_candidate_selfies = gen_selfies
+                            best_similarity_score = 1.0
                             break
-                        elif gen_selfies and not best_candidate_selfies:
+                        elif chem_equiv and not is_chemically_equivalent:
+                            is_chemically_equivalent = True
                             best_candidate_selfies = gen_selfies
+                            best_similarity_score = similarity
+                        elif similarity > best_similarity_score:
+                            is_partial_match = partial_match
+                            best_candidate_selfies = gen_selfies
+                            best_similarity_score = similarity
 
-                    if not is_exact_match and best_candidate_selfies:
-                        min_len = min(len(best_candidate_selfies), len(target_selfies))
-                        if min_len > 0:
-                            common_prefix = 0
-                            for j in range(min_len):
-                                if best_candidate_selfies[j] == target_selfies[j]:
-                                    common_prefix += 1
-                                else:
-                                    break
-                            is_partial_match = (common_prefix / min_len) > 0.5
-                    
                     if is_exact_match:
                         exact_matches += 1
+                    elif is_chemically_equivalent:
+                        chemical_equivalents += 1
                     elif is_partial_match:
                         partial_matches += 1
                     
@@ -294,30 +299,35 @@ def evaluate_selfies_exact_match(model, config, test_data_file, device, batch_si
                         )[0]
                         
                         is_exact_match = False
+                        is_chemically_equivalent = False
                         is_partial_match = False
                         best_candidate_selfies = ""
+                        best_similarity_score = 0.0
                         
+                        # 检查所有候选结果，找到最好的匹配
                         for gen_selfies in generated_selfies_candidates_single:
-                            if gen_selfies == target_selfies:
+                            exact_match, chem_equiv, partial_match, similarity = check_selfies_correctness(target_selfies, gen_selfies)
+                            
+                            if exact_match:
                                 is_exact_match = True
+                                is_chemically_equivalent = True
+                                is_partial_match = True
                                 best_candidate_selfies = gen_selfies
+                                best_similarity_score = 1.0
                                 break
-                            elif gen_selfies and not best_candidate_selfies:
+                            elif chem_equiv and not is_chemically_equivalent:
+                                is_chemically_equivalent = True
                                 best_candidate_selfies = gen_selfies
+                                best_similarity_score = similarity
+                            elif similarity > best_similarity_score:
+                                is_partial_match = partial_match
+                                best_candidate_selfies = gen_selfies
+                                best_similarity_score = similarity
 
-                        if not is_exact_match and best_candidate_selfies:
-                            min_len = min(len(best_candidate_selfies), len(target_selfies))
-                            if min_len > 0:
-                                common_prefix = 0
-                                for j in range(min_len):
-                                    if best_candidate_selfies[j] == target_selfies[j]:
-                                        common_prefix += 1
-                                    else:
-                                        break
-                                is_partial_match = (common_prefix / min_len) > 0.5
-                        
                         if is_exact_match:
                             exact_matches += 1
+                        elif is_chemically_equivalent:
+                            chemical_equivalents += 1
                         elif is_partial_match:
                             partial_matches += 1
                             
@@ -360,15 +370,17 @@ def evaluate_selfies_exact_match(model, config, test_data_file, device, batch_si
                 print(f"  Processed {total_samples:,} samples - Exact: {current_exact_acc:.2f}%, Partial: {current_partial_acc:.2f}%")
     
     exact_accuracy = exact_matches / total_samples * 100
+    chemical_accuracy = chemical_equivalents / total_samples * 100
     partial_accuracy = partial_matches / total_samples * 100
-    combined_accuracy = (exact_matches + partial_matches) / total_samples * 100
+    combined_accuracy = (exact_matches + chemical_equivalents + partial_matches) / total_samples * 100
     generation_success_rate = (total_samples - generation_failures) / total_samples * 100
     
     print(f"\n🎯 Final Evaluation Results:")
     print(f"  📊 Total samples: {total_samples:,}")
     print(f"  ✅ Exact matches: {exact_matches:,} ({exact_accuracy:.2f}%)")
+    print(f"  🧪 Chemical equivalents: {chemical_equivalents:,} ({chemical_accuracy:.2f}%)")
     print(f"  🔸 Partial matches: {partial_matches:,} ({partial_accuracy:.2f}%)")
-    print(f"  🔸 Combined (exact + partial): {exact_matches + partial_matches:,} ({combined_accuracy:.2f}%)")
+    print(f"  🔸 Combined (exact + chemical + partial): {exact_matches + chemical_equivalents + partial_matches:,} ({combined_accuracy:.2f}%)")
     print(f"  ❌ Generation failures: {generation_failures:,} ({generation_failures/total_samples*100:.2f}%)")
     print(f"  🚀 Generation success rate: {generation_success_rate:.2f}%")
     
@@ -383,9 +395,11 @@ def evaluate_selfies_exact_match(model, config, test_data_file, device, batch_si
     return {
         'total_samples': total_samples,
         'exact_matches': exact_matches,
+        'chemical_equivalents': chemical_equivalents,
         'partial_matches': partial_matches,
         'generation_failures': generation_failures,
         'exact_accuracy': exact_accuracy,
+        'chemical_accuracy': chemical_accuracy,
         'partial_accuracy': partial_accuracy,
         'combined_accuracy': combined_accuracy,
         'generation_success_rate': generation_success_rate,
@@ -417,7 +431,7 @@ def plot_length_distribution(stats, save_path=None):
         print(f"Plotting failed: {e}")
 
 
-def save_evaluation_results(eval_results, stats, model_path, test_data_file, save_dir, k_predictions, temperature):
+def save_evaluation_results(eval_results, stats, model_path, test_data_file, save_dir, k_predictions, temperature, badcase_examples=None, error_counts=None):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_file = os.path.join(save_dir, f"evaluation_results_{timestamp}.txt")
     
@@ -439,6 +453,7 @@ def save_evaluation_results(eval_results, stats, model_path, test_data_file, sav
         f.write("model evaluation results:\n")
         f.write(f"  total test samples: {eval_results['total_samples']:,}\n")
         f.write(f"  exact match: {eval_results['exact_matches']:,} ({eval_results['exact_accuracy']:.2f}%)\n")
+        f.write(f"  chemical equivalents: {eval_results['chemical_equivalents']:,} ({eval_results['chemical_accuracy']:.2f}%)\n")
         f.write(f"  partial match: {eval_results['partial_matches']:,} ({eval_results['partial_accuracy']:.2f}%)\n")
         f.write(f"  combined accuracy: {eval_results['combined_accuracy']:.2f}%\n")
         f.write(f"  generation failed: {eval_results['generation_failures']:,}\n")
@@ -449,26 +464,328 @@ def save_evaluation_results(eval_results, stats, model_path, test_data_file, sav
             if match_stats['total'] >= 5:
                 acc = match_stats['exact'] / match_stats['total'] * 100
                 f.write(f"  {length} tokens: {match_stats['exact']}/{match_stats['total']} = {acc:.1f}%\n")
+        
+        # 添加badcase统计
+        if error_counts:
+            f.write(f"\nBadcase error type statistics:\n")
+            total_errors = sum(error_counts.values())
+            sorted_errors = sorted(error_counts.items(), key=lambda x: x[1], reverse=True)
+            
+            for error_type, count in sorted_errors:
+                if count > 0:
+                    percentage = count / total_errors * 100 if total_errors > 0 else 0
+                    f.write(f"  {error_type}: {count} ({percentage:.1f}%)\n")
     
     print(f"📄 evaluation results saved to: {results_file}")
     return results_file
+
+
+def analyze_badcase(target_selfies, generated_selfies, formula):
+    """分析badcase的具体错误类型"""
+    error_types = []
+    
+    if not generated_selfies or generated_selfies == "":
+        return ["generation_failure"], "生成失败"
+    
+    # 检查SELFIES语法有效性
+    try:
+        sf.decoder(generated_selfies)
+        is_valid_selfies = True
+    except:
+        is_valid_selfies = False
+        error_types.append("invalid_selfies")
+    
+    # 长度分析
+    target_tokens = list(sf.split_selfies(target_selfies))
+    try:
+        generated_tokens = list(sf.split_selfies(generated_selfies))
+    except:
+        generated_tokens = []
+    
+    target_len = len(target_tokens)
+    generated_len = len(generated_tokens)
+    
+    length_ratio = generated_len / target_len if target_len > 0 else 0
+    
+    if length_ratio < 0.5:
+        error_types.append("too_short")
+    elif length_ratio > 2.0:
+        error_types.append("too_long")
+    elif abs(length_ratio - 1.0) > 0.3:
+        error_types.append("length_mismatch")
+    
+    if generated_tokens and target_tokens:
+        common_prefix = 0
+        min_len = min(len(target_tokens), len(generated_tokens))
+        for i in range(min_len):
+            if target_tokens[i] == generated_tokens[i]:
+                common_prefix += 1
+            else:
+                break
+        
+        prefix_ratio = common_prefix / min_len if min_len > 0 else 0
+        
+        if prefix_ratio > 0.8:
+            error_types.append("suffix_error")
+        elif prefix_ratio > 0.5:
+            error_types.append("partial_match")
+        elif prefix_ratio < 0.2:
+            error_types.append("completely_wrong")
+    
+    # check consecutive repeats
+    if generated_tokens:
+        consecutive_repeats = 0
+        for i in range(1, len(generated_tokens)):
+            if generated_tokens[i] == generated_tokens[i-1]:
+                consecutive_repeats += 1
+        
+        if consecutive_repeats > len(generated_tokens) * 0.3:
+            error_types.append("repetitive")
+    
+    # check truncated
+    if generated_selfies.endswith('[') or generated_selfies.count('[') != generated_selfies.count(']'):
+        error_types.append("truncated")
+    
+    # if no other error types, but mismatch, classify as general error
+    if not error_types and generated_selfies != target_selfies:
+        error_types.append("general_mismatch")
+    
+    # generate error description
+    error_desc = f"长度: {generated_len}/{target_len} ({length_ratio:.2f}x)"
+    if not is_valid_selfies:
+        error_desc += ", 无效SELFIES"
+    
+    return error_types, error_desc
+
+
+def collect_badcase_examples(results, max_examples_per_type=5):
+    """collect examples for each error type"""
+    badcase_examples = {
+        "generation_failure": [],
+        "invalid_selfies": [],
+        "too_short": [],
+        "too_long": [],
+        "length_mismatch": [],
+        "suffix_error": [],
+        "partial_match": [],
+        "completely_wrong": [],
+        "repetitive": [],
+        "truncated": [],
+        "general_mismatch": []
+    }
+    
+    error_counts = {key: 0 for key in badcase_examples.keys()}
+    
+    for result in results:
+        if result['exact_match']:
+            continue
+            
+        target_selfies = result['target_selfies']
+        generated_selfies_list = result['generated_selfies']
+        formula = result['formula']
+        
+        # take the first generated result for analysis
+        generated_selfies = generated_selfies_list[0] if generated_selfies_list else ""
+        
+        error_types, error_desc = analyze_badcase(target_selfies, generated_selfies, formula)
+        
+        for error_type in error_types:
+            error_counts[error_type] += 1
+            
+            if len(badcase_examples[error_type]) < max_examples_per_type:
+                badcase_examples[error_type].append({
+                    'sample_idx': result['sample_idx'],
+                    'formula': formula,
+                    'target_selfies': target_selfies,
+                    'generated_selfies': generated_selfies,
+                    'error_desc': error_desc,
+                    'target_length': len(list(sf.split_selfies(target_selfies))),
+                    'generated_length': len(list(sf.split_selfies(generated_selfies))) if generated_selfies else 0
+                })
+    
+    return badcase_examples, error_counts
+
+
+def print_badcase_analysis(badcase_examples, error_counts, total_errors):
+    """打印badcase分析结果"""
+    print(f"\n🔍 Badcase 分析报告")
+    print(f"{'='*60}")
+    
+    # sort by error count
+    sorted_errors = sorted(error_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    for error_type, count in sorted_errors:
+        if count == 0:
+            continue
+            
+        percentage = count / total_errors * 100 if total_errors > 0 else 0
+        print(f"\n📊 {error_type.upper()}: {count} 个 ({percentage:.1f}%)")
+        
+        error_type_names = {
+            "generation_failure": "生成失败",
+            "invalid_selfies": "无效SELFIES语法",
+            "too_short": "生成过短",
+            "too_long": "生成过长", 
+            "length_mismatch": "长度不匹配",
+            "suffix_error": "前缀正确但后缀错误",
+            "partial_match": "部分匹配",
+            "completely_wrong": "完全错误",
+            "repetitive": "重复生成",
+            "truncated": "截断错误",
+            "general_mismatch": "一般不匹配"
+        }
+        
+        print(f"   类型: {error_type_names.get(error_type, error_type)}")
+        
+        examples = badcase_examples[error_type]
+        for i, example in enumerate(examples[:5], 1):
+            print(f"\n   样例 {i}:")
+            print(f"     分子式: {example['formula']}")
+            print(f"     真实值: {example['target_selfies'][:100]}{'...' if len(example['target_selfies']) > 100 else ''}")
+            print(f"     生成值: {example['generated_selfies'][:100]}{'...' if len(example['generated_selfies']) > 100 else ''}")
+            print(f"     错误信息: {example['error_desc']}")
+        
+        if len(examples) > 5:
+            print(f"   ... 还有 {len(examples) - 5} 个样例")
+
+
+def save_badcase_analysis(badcase_examples, error_counts, save_dir, timestamp):
+    """save badcase analysis to file"""
+    badcase_file = os.path.join(save_dir, f"badcase_analysis_{timestamp}.txt")
+    
+    with open(badcase_file, 'w', encoding='utf-8') as f:
+        f.write("BADCASE 分析报告\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"生成时间: {datetime.now()}\n\n")
+        
+        total_errors = sum(error_counts.values())
+        sorted_errors = sorted(error_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        for error_type, count in sorted_errors:
+            if count == 0:
+                continue
+                
+            percentage = count / total_errors * 100 if total_errors > 0 else 0
+            f.write(f"\n{error_type.upper()}: {count} 个 ({percentage:.1f}%)\n")
+            f.write("-" * 30 + "\n")
+            
+            examples = badcase_examples[error_type]
+            for i, example in enumerate(examples, 1):
+                f.write(f"\n样例 {i}:\n")
+                f.write(f"  样本ID: {example['sample_idx']}\n")
+                f.write(f"  分子式: {example['formula']}\n")
+                f.write(f"  真实SELFIES: {example['target_selfies']}\n")
+                f.write(f"  生成SELFIES: {example['generated_selfies']}\n")
+                f.write(f"  错误描述: {example['error_desc']}\n")
+                f.write(f"  长度对比: {example['generated_length']}/{example['target_length']}\n")
+    
+    print(f"📄 Badcase分析保存到: {badcase_file}")
+    return badcase_file
+
+
+def check_selfies_correctness(target_selfies, generated_selfies):
+    """
+    检查生成的SELFIES的正确性
+    返回: (is_exact_match, is_chemically_equivalent, is_partial_match, similarity_score)
+    """
+    if not generated_selfies or generated_selfies.strip() == "":
+        return False, False, False, 0.0
+    
+    # 1. 精确匹配（字符串完全相同）
+    if generated_selfies.strip() == target_selfies.strip():
+        return True, True, True, 1.0
+    
+    # 2. 化学等价性检查（转换为SMILES后比较）
+    is_chemically_equivalent = False
+    try:
+        target_smiles = sf.decoder(target_selfies)
+        generated_smiles = sf.decoder(generated_selfies)
+        
+        # 标准化SMILES进行比较
+        from rdkit import Chem
+        target_mol = Chem.MolFromSmiles(target_smiles)
+        generated_mol = Chem.MolFromSmiles(generated_smiles)
+        
+        if target_mol is not None and generated_mol is not None:
+            target_canonical = Chem.MolToSmiles(target_mol, canonical=True)
+            generated_canonical = Chem.MolToSmiles(generated_mol, canonical=True)
+            is_chemically_equivalent = (target_canonical == generated_canonical)
+    except:
+        # 如果转换失败，说明生成的SELFIES无效
+        is_chemically_equivalent = False
+    
+    # 3. Token级别的相似度计算
+    try:
+        target_tokens = list(sf.split_selfies(target_selfies))
+        generated_tokens = list(sf.split_selfies(generated_selfies))
+    except:
+        target_tokens = []
+        generated_tokens = []
+    
+    if not target_tokens or not generated_tokens:
+        return False, is_chemically_equivalent, False, 0.0
+    
+    # 计算token级别的相似度
+    # 方法1: 最长公共子序列 (LCS)
+    def lcs_length(seq1, seq2):
+        m, n = len(seq1), len(seq2)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if seq1[i-1] == seq2[j-1]:
+                    dp[i][j] = dp[i-1][j-1] + 1
+                else:
+                    dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+        
+        return dp[m][n]
+    
+    lcs_len = lcs_length(target_tokens, generated_tokens)
+    max_len = max(len(target_tokens), len(generated_tokens))
+    lcs_similarity = lcs_len / max_len if max_len > 0 else 0.0
+    
+    # 方法2: 前缀匹配
+    common_prefix = 0
+    min_len = min(len(target_tokens), len(generated_tokens))
+    for i in range(min_len):
+        if target_tokens[i] == generated_tokens[i]:
+            common_prefix += 1
+        else:
+            break
+    
+    prefix_similarity = common_prefix / min_len if min_len > 0 else 0.0
+    
+    # 方法3: Jaccard相似度（token集合的交集/并集）
+    target_set = set(target_tokens)
+    generated_set = set(generated_tokens)
+    intersection = len(target_set & generated_set)
+    union = len(target_set | generated_set)
+    jaccard_similarity = intersection / union if union > 0 else 0.0
+    
+    # 综合相似度分数
+    similarity_score = (lcs_similarity * 0.4 + prefix_similarity * 0.4 + jaccard_similarity * 0.2)
+    
+    # 判断是否为部分匹配
+    is_partial_match = similarity_score > 0.5 or prefix_similarity > 0.6
+    
+    return False, is_chemically_equivalent, is_partial_match, similarity_score
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate best model SELFIES exact match accuracy on test set")
     
     parser.add_argument("--model_path", type=str, 
-                       default="./pretrained_selfies_transformer/best_model.pt",
+                       default="./pretrained_selfies_transformer/final_model.pt",
                        help="Best model checkpoint path")
     parser.add_argument("--test_data_file", type=str,
-                       default="/hy-tmp/MCTS/MassEnv/DataLoader/test_spectrum_embeds_msg.pt",
+                       default="/hy-tmp/MassEnv/DataLoader/test_spectrum_embeds_msg.pt",
                        help="Test data file path")
     
-    parser.add_argument("--batch_size", type=int, default=64,
+    parser.add_argument("--batch_size", type=int, default=512,
                        help="Batch size")
-    parser.add_argument("--device", type=str, default="auto",
+    parser.add_argument("--device", type=torch.device, default="cuda",
                        help="Device (auto/cuda/cpu)")
-    parser.add_argument("--max_generation_length", type=int, default=50,
+    parser.add_argument("--max_generation_length", type=int, default=120,
                        help="Maximum generation length")
     
     parser.add_argument("--k_predictions", type=int, default=1,
@@ -482,13 +799,18 @@ def main():
                        help="Results save directory")
     parser.add_argument("--plot_distribution", action="store_true", default=True,
                        help="Plot length distribution")
+    parser.add_argument("--analyze_badcase", action="store_true", default=True,
+                       help="Perform detailed badcase analysis")
+    parser.add_argument("--badcase_examples_per_type", type=int, default=5,
+                       help="Number of examples to collect per error type")
     
     args = parser.parse_args()
-    
+
     if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Auto-detected device: {device}")
     else:
-        device = args.device
+        device = torch.device(args.device)
     print(f"🖥️ Using device: {device}")
     
     if not os.path.exists(args.model_path):
@@ -534,18 +856,30 @@ def main():
         k_predictions=args.k_predictions, temperature=args.temperature
     )
     
-    if args.save_results:
-        save_evaluation_results(
-            eval_results, stats, args.model_path, args.test_data_file, args.results_dir,
-            args.k_predictions, args.temperature
-        )
-    
-    print(f"\n🎉 Evaluation completed!")
     print(f"📊 Final results:")
     print(f"   - SELFIES exact match accuracy = {eval_results['exact_accuracy']:.2f}%")
+    print(f"   - SELFIES chemical equivalents = {eval_results['chemical_accuracy']:.2f}%")
     print(f"   - SELFIES partial match accuracy = {eval_results['partial_accuracy']:.2f}%")
     print(f"   - Combined accuracy = {eval_results['combined_accuracy']:.2f}%")
 
+    # 进行badcase分析
+    if args.analyze_badcase:
+        badcase_examples, error_counts = collect_badcase_examples(eval_results['results'], args.badcase_examples_per_type)
+        print_badcase_analysis(badcase_examples, error_counts, eval_results['total_samples'] - eval_results['exact_matches'])
+    else:
+        badcase_examples, error_counts = None, None
+    
+    if args.save_results:
+        save_evaluation_results(
+            eval_results, stats, args.model_path, args.test_data_file, args.results_dir,
+            args.k_predictions, args.temperature, badcase_examples, error_counts
+        )
+        if args.analyze_badcase and badcase_examples:
+            save_badcase_analysis(badcase_examples, error_counts, args.results_dir, datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+    print(f"\n🎉 Evaluation completed!")
+
 
 if __name__ == "__main__":
+    print(torch.cuda.is_available())
     main() 

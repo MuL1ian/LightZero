@@ -234,19 +234,22 @@ class MassSelfiesED(nn.Module):
         max_len: int = 120,
         n_dec=12, 
         dropout=0.1,
-        num_projectors=16, # how many linear decomposers for spectrum 4096 ---> N * 512
-        spectrum_chunk_size=512, # each chunk is 512
-        n_head=16, # how many heads for multi-head self-attention
+        spectrum_chunk_size=256, # each chunk size  
+        spectrum_attention_heads=4, # attention heads for spectrum decomposer
+        n_head=16, # heads for main transformer decoder
         d_model=512, # dimension of the model
         device="cuda",
     ):
         super().__init__()
+
         self.device = torch.device(device)
         self.spectrum_dim = 4096
-        self.num_projectors = num_projectors
         self.spectrum_chunk_size = spectrum_chunk_size
+        self.spectrum_attention_heads = spectrum_attention_heads  # 清晰命名
         self.n_head = n_head
         self.d_model = d_model
+
+        self.num_chunks = self.spectrum_dim // self.spectrum_chunk_size # how many chunks 
 
         # tokenizer for special ids and pad
         self.tokenizer = SelfiesTokenizer(max_len=max_len)
@@ -268,30 +271,17 @@ class MassSelfiesED(nn.Module):
         self.pos_embed   = nn.Embedding(max_len, self.d_model)
  
 
-        # Multiple linear layers for learned decomposition (each learns different "aspects")
-        self.spectrum_projectors = nn.ModuleList([
-            nn.Linear(self.spectrum_dim, self.spectrum_chunk_size) 
-            for _ in range(self.num_projectors)
-        ])
-        
+
         # Multi-head self-attention for spectrum decomposition
         self.spectrum_decomposer = nn.MultiheadAttention(
-            embed_dim=self.spectrum_chunk_size,  # Should match the chunk size
-            num_heads=min(self.n_head, self.spectrum_chunk_size // 64),
+            embed_dim=self.spectrum_chunk_size,  # 256
+            num_heads=self.spectrum_attention_heads,  # 4
             dropout=dropout,
             batch_first=True
         )
-        
-        # Project spectrum chunks to model dimension if needed
-        if self.spectrum_chunk_size != self.d_model:
-            self.spectrum_to_model_proj = nn.Linear(self.spectrum_chunk_size, self.d_model)
-        else:
-            self.spectrum_to_model_proj = nn.Identity()
 
-        # # Spectrum encoder layers
-        # enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head,
-        #                                        dropout=dropout, batch_first=True)
-        # self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_enc)
+        # Projection from chunk_size to d_model
+        self.chunk_to_model_proj = nn.Linear(self.spectrum_chunk_size, self.d_model) 
         
         # Decoder Only
         dec_layer = nn.TransformerDecoderLayer(
@@ -316,37 +306,28 @@ class MassSelfiesED(nn.Module):
 
     def _prepare_spectrum_memory(self, spectrum_embed: torch.Tensor) -> torch.Tensor:
         """
-        Spectrum embedding is decomposed using learned projections and self-attention is applied.
+        Spectrum embedding is decomposed using direct chunking and self-attention is applied.
         
         Args:
             spectrum_embed: (B, spectrum_dim) spectrum embedding
             
         Returns:
-            torch.Tensor: (B, num_projectors, d_model) spectrum memory
+            torch.Tensor: (B, spectrum_heads, d_model) spectrum memory
         """
         batch_size = spectrum_embed.size(0)
         
-        # Use learned projections instead of simple view split
-        # Each linear layer learns to focus on different "aspects" of the spectrum
-        projected_heads = []
-        for projector in self.spectrum_projectors:
-            projected = projector(spectrum_embed)  # (B, spectrum_chunk_size)
-            projected_heads.append(projected)
+        spectrum_sequence = spectrum_embed.view(batch_size, self.num_chunks, self.spectrum_chunk_size)
         
-        # Stack to create sequence: [batch_size, num_projectors, spectrum_chunk_size]
-        spectrum_sequence = torch.stack(projected_heads, dim=1)
-        
-        # Apply multi-head self-attention to learned spectrum projections
-        # This allows different learned aspects to interact with each other
+        # Apply multi-head self-attention to spectrum chunks
         spectrum_attended, _ = self.spectrum_decomposer(
             query=spectrum_sequence,
             key=spectrum_sequence, 
             value=spectrum_sequence
-        )  # [batch_size, num_projectors, spectrum_chunk_size]
+        )  # [batch_size, num_chunks, chunk_size]
         
-        # Project to model dimension if needed
-        spectrum_memory = self.spectrum_to_model_proj(spectrum_attended)  # (B, num_projectors, d_model)
-        
+        # Project to model dimension
+        spectrum_memory = self.chunk_to_model_proj(spectrum_attended) # [batch_size, num_chunks, d_model]
+
         return spectrum_memory
 
     def forward_pretrain(
@@ -371,8 +352,8 @@ class MassSelfiesED(nn.Module):
         tgt_mask = tgt_mask.to(self.device)
         B, T = tgt_tokens.shape
 
-        spectrum_memory = self._prepare_spectrum_memory(spectrum_embed)  # (B, spectrum_heads, embed_dim)
-        memory = spectrum_memory  # (B, spectrum_heads, embed_dim)
+        spectrum_memory = self._prepare_spectrum_memory(spectrum_embed)  # (B, spectrum_heads, d_model)
+        memory = spectrum_memory  # (B, spectrum_heads, d_model)
 
         # Decoder
         pos_ids = torch.arange(T, device=self.device).unsqueeze(0).expand(B, -1)
@@ -403,9 +384,9 @@ class MassSelfiesED(nn.Module):
         tgt_mask   = tgt_mask.to(self.device)
         B, T = tgt_tokens.shape
 
-        spectrum_memory = self._prepare_spectrum_memory(spectrum_embed)  # (B, spectrum_heads, embed_dim)
+        spectrum_memory = self._prepare_spectrum_memory(spectrum_embed)  # (B, spectrum_heads, d_model)
         
-        memory = spectrum_memory  # (B, spectrum_heads, embed_dim)
+        memory = spectrum_memory  # (B, spectrum_heads, d_model)
 
         # Decoder
         pos_ids  = torch.arange(T, device=self.device).unsqueeze(0)

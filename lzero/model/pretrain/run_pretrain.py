@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import torch.serialization
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 import json
 import os
 from tqdm import tqdm
@@ -88,21 +89,49 @@ class RealSpectrumSelfiesDataset(Dataset):
         # encode selfies to token ids
         tokens = [self.tokenizer.sos_token_id]
         try:
-            selfies_tokens = self.tokenizer.encode_selfies(selfies, add_special_tokens=False)
+            # 🔧 关键修复：获取真实的SELFIES token，不要填充的
+            import selfies as sf
+            selfies_token_list = list(sf.split_selfies(selfies))
+            
+            # 手动编码每个SELFIES token
+            selfies_tokens = []
+            vocab = self.tokenizer.get_vocab()
+            for token in selfies_token_list:
+                if token in vocab:
+                    selfies_tokens.append(vocab[token])
+                else:
+                    # 如果token不在词汇表中，跳过或使用UNK
+                    print(f"Warning: Unknown SELFIES token: {token}")
+                    continue
+            
+            # 预留空间给EOS token，确保不被截断
+            max_selfies_len = self.max_len - 2  # 预留SOS和EOS的空间
+            if len(selfies_tokens) > max_selfies_len:
+                selfies_tokens = selfies_tokens[:max_selfies_len]
+            
             tokens.extend(selfies_tokens)
+            tokens.append(self.tokenizer.eos_token_id)
         except Exception as e:
             # if encoding failed, use empty sequence
             print(f"Warning: Failed to encode SELFIES '{selfies}': {e}")
             tokens = [self.tokenizer.sos_token_id, self.tokenizer.eos_token_id]
         
-        # truncate or pad to max_len
-        if len(tokens) > self.max_len:
-            tokens = tokens[:self.max_len]
-        else:
-            tokens.extend([self.tokenizer.pad_token_id] * (self.max_len - len(tokens)))
+        # 🔧 关键修复：不要填充！保持原始长度让EOS位置多样化
+        # tokens现在是: [SOS, selfies_tokens..., EOS] (长度可变)
         
-        input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
-        target_ids = torch.tensor(tokens[1:], dtype=torch.long)
+        input_ids = torch.tensor(tokens[:-1], dtype=torch.long)  # [SOS, selfies_tokens...]
+        target_ids = torch.tensor(tokens[1:], dtype=torch.long)   # [selfies_tokens..., EOS]
+        
+        # 填充input_ids和target_ids到max_len-1 (因为模型期望固定长度)
+        max_seq_len = self.max_len - 1  # 119
+        
+        if len(input_ids) < max_seq_len:
+            pad_len = max_seq_len - len(input_ids)
+            input_ids = torch.cat([input_ids, torch.full((pad_len,), self.tokenizer.pad_token_id, dtype=torch.long)])
+        
+        if len(target_ids) < max_seq_len:
+            pad_len = max_seq_len - len(target_ids)
+            target_ids = torch.cat([target_ids, torch.full((pad_len,), self.tokenizer.pad_token_id, dtype=torch.long)])
         
         attention_mask = (input_ids != self.tokenizer.pad_token_id).float()
         
@@ -177,16 +206,15 @@ def create_model(config: PretrainConfig) -> MassSelfiesED:
         d_model=config.d_model,  # Use d_model to match both config and MassSelfiesED class
         n_dec=config.n_dec,
         n_head=config.n_head,
-        num_projectors=config.num_projectors,
         spectrum_chunk_size=config.spectrum_chunk_size,
+        spectrum_attention_heads=config.spectrum_attention_heads,
         dropout=config.dropout,
         device=config.device
-        # Note: num_projectors and spectrum_chunk_size use default values in MassSelfiesED
     )
 
 
 def pretrain_step(model: MassSelfiesED, batch: Dict[str, torch.Tensor], 
-                 loss_fn: PretrainLoss, device: str) -> Tuple[torch.Tensor, Dict[str, float]]:
+                 loss_fn: PretrainLoss, device: str, tokenizer: SelfiesTokenizer = None) -> Tuple[torch.Tensor, Dict[str, float]]:
     """single step pretrain"""
 
     spectrum = batch['spectrum'].to(device)
@@ -204,13 +232,30 @@ def pretrain_step(model: MassSelfiesED, batch: Dict[str, torch.Tensor],
     correct = (predictions == target_ids) & mask
     accuracy = correct.sum().float() / mask.sum().float()
     
+    eos_stats = {}
+    if tokenizer is not None:
+        # count eos in target
+        target_has_eos = (target_ids == tokenizer.eos_token_id).any(dim=1)
+        target_eos_count = target_has_eos.sum().item()
+        
+        # count eos in prediction
+        pred_has_eos = (predictions == tokenizer.eos_token_id).any(dim=1)
+        pred_eos_count = pred_has_eos.sum().item()
+        
+        batch_size = target_ids.size(0)
+        eos_stats = {
+            'target_eos_rate': target_eos_count / batch_size * 100,  
+            'pred_eos_rate': pred_eos_count / batch_size * 100,     
+            'eos_accuracy': (target_has_eos == pred_has_eos).sum().item() / batch_size * 100  
+        }
 
     perplexity = torch.exp(loss)
     
     metrics = {
         'loss': loss.item(),
         'accuracy': accuracy.item(),
-        'perplexity': perplexity.item()
+        'perplexity': perplexity.item(),
+        **eos_stats  
     }
     
     return loss, metrics
@@ -319,8 +364,13 @@ def pretrain_transformer(config: PretrainConfig):
     total_steps = len(train_loader) * config.num_epochs
     scheduler = WarmupLinearSchedule(optimizer, config.warmup_steps, total_steps)
     
-    # create loss function
-    loss_fn = PretrainLoss(config.vocab_size, tokenizer.pad_token_id)
+    # create loss function with label smoothing
+    loss_fn = PretrainLoss(config.vocab_size, tokenizer.pad_token_id, label_smoothing=0.05)
+    
+    print(f"🔍 Loss function setup:")
+    print(f"  PAD token ID (ignored): {tokenizer.pad_token_id}")
+    print(f"  EOS token ID (counted): {tokenizer.eos_token_id}")
+    print(f"  SOS token ID (counted): {tokenizer.sos_token_id}")
     
     # training loop variables
     model.train()
@@ -361,7 +411,7 @@ def pretrain_transformer(config: PretrainConfig):
     
     for epoch in range(config.num_epochs):
         epoch_losses = []
-        epoch_metrics = {'loss': [], 'accuracy': [], 'perplexity': []}
+        epoch_metrics = {'loss': [], 'accuracy': [], 'perplexity': [], 'target_eos_rate': [], 'pred_eos_rate': [], 'eos_accuracy': []}
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
         
@@ -369,7 +419,7 @@ def pretrain_transformer(config: PretrainConfig):
             optimizer.zero_grad()
             
             # forward pass
-            loss, metrics = pretrain_step(model, batch, loss_fn, config.device)
+            loss, metrics = pretrain_step(model, batch, loss_fn, config.device, tokenizer)
             
             # backward pass
             loss.backward()
@@ -388,18 +438,38 @@ def pretrain_transformer(config: PretrainConfig):
                 epoch_metrics[key].append(value)
             
             # update progress bar
-            pbar.set_postfix({
+            postfix_dict = {
                 'loss': f"{loss.item():.4f}",
                 'acc': f"{metrics['accuracy']:.4f}",
                 'ppl': f"{metrics['perplexity']:.2f}",
                 'lr': f"{scheduler.get_lr():.2e}"
-            })
+            }
+            # add eos stats to progress bar
+            if 'pred_eos_rate' in metrics:
+                postfix_dict['eos%'] = f"{metrics['pred_eos_rate']:.1f}"
+            pbar.set_postfix(postfix_dict)
             
             global_step += 1
             
             if global_step % config.log_interval == 0:
                 current_lr = scheduler.get_lr()
                 avg_recent_loss = np.mean(training_stats['train_losses'][-config.log_interval:])
+                
+                recent_metrics = []
+                for i in range(max(0, len(epoch_metrics['accuracy']) - config.log_interval), len(epoch_metrics['accuracy'])):
+                    if i < len(epoch_metrics.get('pred_eos_rate', [])):
+                        recent_metrics.append({
+                            'pred_eos_rate': epoch_metrics['pred_eos_rate'][i],
+                            'target_eos_rate': epoch_metrics['target_eos_rate'][i],
+                            'eos_accuracy': epoch_metrics['eos_accuracy'][i]
+                        })
+                
+                eos_log_str = ""
+                if recent_metrics:
+                    avg_pred_eos = np.mean([m['pred_eos_rate'] for m in recent_metrics])
+                    avg_target_eos = np.mean([m['target_eos_rate'] for m in recent_metrics])
+                    avg_eos_acc = np.mean([m['eos_accuracy'] for m in recent_metrics])
+                    eos_log_str = f", pred_eos={avg_pred_eos:.1f}%, target_eos={avg_target_eos:.1f}%, eos_acc={avg_eos_acc:.1f}%"
                 
                 if log_training_step_fn:
                     log_training_step_fn(
@@ -411,7 +481,7 @@ def pretrain_transformer(config: PretrainConfig):
                         early_stopping_counter=patience_counter
                     )
                 
-                print(f"📈 Step {global_step}: loss={avg_recent_loss:.4f}, lr={current_lr:.2e}")
+                print(f"📈 Step {global_step}: loss={avg_recent_loss:.4f}, lr={current_lr:.2e}{eos_log_str}")
             
             # save checkpoint and validation
             if global_step % config.save_interval == 0:
@@ -420,12 +490,12 @@ def pretrain_transformer(config: PretrainConfig):
                 if val_loader:
                     model.eval()
                     val_losses = []
-                    val_metrics = {'loss': [], 'accuracy': [], 'perplexity': []}
+                    val_metrics = {'loss': [], 'accuracy': [], 'perplexity': [], 'target_eos_rate': [], 'pred_eos_rate': [], 'eos_accuracy': []}
                     
                     print(f"🔍 Running validation at step {global_step}...")
                     with torch.no_grad():
                         for batch in tqdm(val_loader, desc="Validation", leave=False):
-                            loss, metrics = pretrain_step(model, batch, loss_fn, config.device)
+                            loss, metrics = pretrain_step(model, batch, loss_fn, config.device, tokenizer)
                             val_losses.append(loss.item())
                             for key, value in metrics.items():
                                 val_metrics[key].append(value)
@@ -440,6 +510,10 @@ def pretrain_transformer(config: PretrainConfig):
                     print(f"    Loss: {current_val_loss:.4f}")
                     print(f"    Accuracy: {avg_val_metrics['accuracy']:.4f}")
                     print(f"    Perplexity: {val_perplexity:.2f}")
+                    if 'pred_eos_rate' in avg_val_metrics:
+                        print(f"    Target EOS Rate: {avg_val_metrics['target_eos_rate']:.1f}%")
+                        print(f"    Predicted EOS Rate: {avg_val_metrics['pred_eos_rate']:.1f}%")
+                        print(f"    EOS Accuracy: {avg_val_metrics['eos_accuracy']:.1f}%")
 
                     # CSV logging
                     if not csv_header_written:
@@ -559,12 +633,17 @@ def create_dataloader_from_pt(data_file: str, batch_size: int = 32, max_len: int
     ), tokenizer
 
 
-def load_pretrained_model(checkpoint_path: str, device: str = "cuda") -> Tuple[MassSelfiesED, PretrainConfig]:
+def load_pretrained_model(checkpoint_path: str, device: torch.device) -> Tuple[MassSelfiesED, PretrainConfig]:
     """load pretrained model"""
+    
     print(f"Loading model from {checkpoint_path}")
     
+    if isinstance(device, str):
+        device = torch.device(device)
+    
+    print(f"🔧 Target device: {device}")
+    
     try:
-        import torch.serialization
         with torch.serialization.safe_globals([PretrainConfig]):
             checkpoint = torch.load(checkpoint_path, map_location=device)
     except Exception as e:
@@ -577,13 +656,41 @@ def load_pretrained_model(checkpoint_path: str, device: str = "cuda") -> Tuple[M
     
     config = checkpoint['config']
     
+    print(f"\n📋 Config 内容:")
+    print(f"{'='*50}")
+    if hasattr(config, '__dict__'):
+        for key, value in config.__dict__.items():
+            print(f"  {key}: {value}")
+    else:
+        # 如果是dataclass，也可以这样打印
+        import dataclasses
+        if dataclasses.is_dataclass(config):
+            for field in dataclasses.fields(config):
+                value = getattr(config, field.name)
+                print(f"  {field.name}: {value}")
+        else:
+            print(f"  Config type: {type(config)}")
+            print(f"  Config: {config}")
+    print(f"{'='*50}\n")
+    
+    config.device = str(device)
+    
     tokenizer = SelfiesTokenizer(max_len=config.max_len)
     config.vocab_size = len(tokenizer.get_vocab())
     
+    print(f"🔧 Creating model...")
     model = create_model(config)
+    
+    print(f"🔧 Loading model state dict...")
     model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
+    
+    print(f"🔧 Moving model to device: {device}")
+    model = model.to(device)
     model.eval()
+    
+    # 验证模型确实在正确的设备上
+    model_device = next(model.parameters()).device
+    print(f"🔍 Model actual device after loading: {model_device}")
     
     print(f"✅ Model loaded successfully")
     print(f"📊 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -591,226 +698,22 @@ def load_pretrained_model(checkpoint_path: str, device: str = "cuda") -> Tuple[M
     return model, config
 
 
-def generate_selfies_greedy(model: MassSelfiesED, spectrum: torch.Tensor, 
-                           tokenizer: SelfiesTokenizer, max_len: int = 120, device: str = "cuda") -> str:
-    """Generate SELFIES sequence greedily from spectrum"""
-    model.eval()
-    
-    with torch.no_grad():
-        spectrum = spectrum.unsqueeze(0).to(device)  # (1, 4096)
-        
-        # Start with SOS token
-        input_ids = torch.tensor([[tokenizer.sos_token_id]], device=device)  # (1, 1)
-        
-        for _ in range(max_len - 1):
-            # Create attention mask
-            attention_mask = torch.ones_like(input_ids, dtype=torch.float)
-            
-            # Get logits for next token
-            logits = model.forward_pretrain(spectrum, input_ids, attention_mask)  # (1, seq_len, vocab_size)
-            next_token_logits = logits[0, -1, :]  # (vocab_size,)
-            
-            # Greedy selection
-            next_token_id = torch.argmax(next_token_logits).item()
-            
-            # Stop if EOS token
-            if next_token_id == tokenizer.eos_token_id:
-                break
-                
-            # Append next token
-            next_token_tensor = torch.tensor([[next_token_id]], device=device)
-            input_ids = torch.cat([input_ids, next_token_tensor], dim=1)
-        
-        # Decode to SELFIES
-        generated_tokens = input_ids[0].tolist()
-        # Remove SOS token for decoding
-        if generated_tokens[0] == tokenizer.sos_token_id:
-            generated_tokens = generated_tokens[1:]
-        
-        generated_selfies = tokenizer.decode_to_selfies(generated_tokens, skip_special_tokens=True)
-        return generated_selfies
-
-
-def generate_selfies_batch_greedy(model: MassSelfiesED, spectrum_batch: torch.Tensor, 
-                                 tokenizer: SelfiesTokenizer, max_len: int = 120, device: str = "cuda") -> List[str]:
-    """Generate SELFIES sequences greedily from spectrum batch - much faster!"""
-    model.eval()
-    
-    with torch.no_grad():
-        batch_size = spectrum_batch.shape[0]
-        spectrum_batch = spectrum_batch.to(device)  # (B, 4096)
-        
-        # Start with SOS tokens for all samples
-        input_ids = torch.full((batch_size, 1), tokenizer.sos_token_id, device=device)  # (B, 1)
-        
-        # Track which sequences are still generating (not finished with EOS)
-        is_generating = torch.ones(batch_size, dtype=torch.bool, device=device)  # (B,)
-        
-        for step in range(max_len - 1):
-            if not is_generating.any():
-                break
-                
-            # Create attention mask
-            attention_mask = torch.ones_like(input_ids, dtype=torch.float)
-            
-            # Get logits for next token for all samples
-            logits = model.forward_pretrain(spectrum_batch, input_ids, attention_mask)  # (B, T, vocab_size)
-            next_token_logits = logits[:, -1, :]  # (B, vocab_size)
-            
-            # Greedy selection for all samples
-            next_token_ids = torch.argmax(next_token_logits, dim=-1)  # (B,)
-            
-            # Stop generation for sequences that hit EOS
-            eos_mask = (next_token_ids == tokenizer.eos_token_id)
-            is_generating = is_generating & ~eos_mask
-            
-            # For finished sequences, use PAD token instead of EOS to continue the tensor
-            next_token_ids = torch.where(is_generating, next_token_ids, tokenizer.pad_token_id)
-            
-            # Append next tokens
-            input_ids = torch.cat([input_ids, next_token_ids.unsqueeze(1)], dim=1)  # (B, T+1)
-        
-        # Decode all sequences to SELFIES
-        generated_selfies_list = []
-        for i in range(batch_size):
-            generated_tokens = input_ids[i].tolist()
-            
-            # Remove SOS token and anything after EOS/PAD
-            if generated_tokens[0] == tokenizer.sos_token_id:
-                generated_tokens = generated_tokens[1:]
-            
-            # Find first EOS or PAD and truncate there
-            for j, token in enumerate(generated_tokens):
-                if token in [tokenizer.eos_token_id, tokenizer.pad_token_id]:
-                    generated_tokens = generated_tokens[:j]
-                    break
-            
-            try:
-                generated_selfies = tokenizer.decode_to_selfies(generated_tokens, skip_special_tokens=True)
-                generated_selfies_list.append(generated_selfies)
-            except Exception as e:
-                print(f"Warning: Failed to decode tokens {generated_tokens}: {e}")
-                generated_selfies_list.append("")
-        
-        return generated_selfies_list
-
-
-def evaluate_on_test_set(model: MassSelfiesED, config: PretrainConfig, test_data_path: str = "../../DataLoader/test_spectrum_embeds_msg.pt", batch_size: int = 32):
-    """Evaluate model on test set with batch processing for speed"""
-    print(f"\n{'='*80}")
-    print(f"🧪 EVALUATING MODEL ON TEST SET (Batch Size: {batch_size})")
-    print(f"{'='*80}")
-    
-    # Load test data
-    try:
-        test_loader, tokenizer = create_dataloader_from_pt(
-            test_data_path, 
-            batch_size=batch_size, 
-            max_len=config.max_len, 
-            shuffle=False
-        )
-        print(f"✅ Successfully loaded test data from: {test_data_path}")
-        print(f"📊 Test set size: {len(test_loader.dataset)} samples")
-        print(f"🚀 Using batch size: {batch_size} for faster evaluation")
-    except Exception as e:
-        print(f"❌ Failed to load test data: {e}")
-        return
-    
-    model.eval()
-    correct_predictions = 0
-    total_predictions = 0
-    
-    print(f"\n🔄 Starting batch evaluation...")
-    
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(test_loader, desc="Evaluating batches")):
-            spectrum_batch = batch['spectrum']  # (B, 4096)
-            target_selfies_batch = batch['selfies']  # List of strings
-            current_batch_size = spectrum_batch.shape[0]
-            
-            # Generate SELFIES for entire batch
-            try:
-                generated_selfies_batch = generate_selfies_batch_greedy(
-                    model, 
-                    spectrum_batch, 
-                    tokenizer, 
-                    max_len=config.max_len, 
-                    device=config.device
-                )
-                
-                # Check exact matches for each sample in batch
-                for i in range(current_batch_size):
-                    target_selfies = target_selfies_batch[i]
-                    generated_selfies = generated_selfies_batch[i]
-                    
-                    if generated_selfies.replace(" ", "") == target_selfies.replace(" ", ""):
-                        correct_predictions += 1
-                    
-                    total_predictions += 1
-                    
-                    # Print first few examples from first batch
-                    if batch_idx == 0 and i < 5:
-                        print(f"\n--- Example {i+1} ---")
-                        print(f"Target:    {target_selfies}")
-                        print(f"Generated: {generated_selfies}")
-                        print(f"Match: {'✅' if generated_selfies.replace(' ', '') == target_selfies.replace(' ', '') else '❌'}")
-                        
-            except Exception as e:
-                print(f"❌ Failed to generate for batch {batch_idx}: {e}")
-                total_predictions += current_batch_size
-                continue
-            
-            # Print progress every 10 batches
-            if (batch_idx + 1) % 10 == 0:
-                current_accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
-                print(f"📊 Progress: {total_predictions} samples processed, current accuracy: {current_accuracy:.4f} ({current_accuracy*100:.2f}%)")
-    
-    # Calculate final accuracy
-    accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
-    
-    print(f"\n{'='*80}")
-    print(f"📊 FINAL EVALUATION RESULTS")
-    print(f"{'='*80}")
-    print(f"✅ Exact matches: {correct_predictions}/{total_predictions}")
-    print(f"🎯 Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
-    print(f"🚀 Batch size used: {batch_size}")
-    print(f"{'='*80}")
-    
-    return accuracy
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pretrain SELFIES Transformer")
     parser.add_argument("--load_checkpoint", type=str, help="Path to checkpoint to load")
     parser.add_argument("--eval_on_test", action="store_true", help="Evaluate on test set")
     parser.add_argument("--test_generation", action="store_true", help="Test generation capabilities")
-    parser.add_argument("--test_data_path", type=str, default="/hy-tmp/MCTS/MassEnv/DataLoader/test_spectrum_embeds_msg.pt", 
+    parser.add_argument("--test_data_path", type=str, default="/hy-tmp/MassEnv/DataLoader/test_spectrum_embeds_msg.pt", 
                         help="Path to test data file")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation (default: 32)")
     
     args = parser.parse_args()
     
-    if args.load_checkpoint:
-        # Load pretrained model
-        print(f"Loading model from checkpoint: {args.load_checkpoint}")
-        try:
-            model, config = load_pretrained_model(args.load_checkpoint, device="cuda" if torch.cuda.is_available() else "cpu")
-            
-            if args.eval_on_test or args.test_generation:
-                # Run evaluation with specified batch size
-                accuracy = evaluate_on_test_set(model, config, args.test_data_path, batch_size=args.batch_size)
-                print(f"Final test accuracy: {accuracy:.4f}")
-            else:
-                print("Model loaded successfully. Use --eval_on_test to evaluate.")
-                
-        except Exception as e:
-            print(f"❌ Failed to load checkpoint: {e}")
-    else:
-        # Normal pretraining
-        config = PretrainConfig(
-            save_dir="./pretrained_selfies_transformer"
-        )
+    config = PretrainConfig(
+        save_dir="./pretrained_selfies_transformer"
+    )
+    print(f"USING DEVICE: {config.device}")
         
-        # start pretrain
-        pretrain_transformer(config)
-        print("Pretraining completed!") 
+    # start pretrain
+    pretrain_transformer(config)
+    print("Pretraining completed!") 

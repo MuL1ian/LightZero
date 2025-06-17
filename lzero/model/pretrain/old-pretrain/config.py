@@ -31,17 +31,13 @@ class PretrainConfig:
     weight_decay: float = 0.02    
     
     # Value head training parameters
-    train_value_head: bool = True               # whether to train value head
-    value_loss_weight: float = 0.2             # weight for value loss
+    # i dont train value for this config
+    train_value_head: bool = False              # whether to train value head
+    value_loss_weight: float = 0.5             # weight for value loss
     
-    # Value warmup parameters
-    enable_value_warmup: bool = True           # whether to enable value training warmup
-    value_warmup_steps: int = 2000             # number of steps to warmup value training (policy trains alone first)
-    
-    # Value training strategy parameters
-    value_training_strategy: str = "teacher_forcing"  # "teacher_forcing" or "corrupted_sequences"
-    add_noise_to_value_labels: bool = True      # add noise to value labels for robustness
-    value_noise_prob: float = 0.1              # probability of flipping value labels
+    # Sequence corruption parameters for value head training
+    corruption_prob: float = 0.5               # corruption probability for each sequence
+    corruption_ratio: float = 0.2              # corruption ratio for each sequence
     
     # Early stopping
     early_stopping_patience: int = 8
@@ -52,7 +48,7 @@ class PretrainConfig:
     spectrum_dim: int = 4096
     
     # Save parameters
-    save_dir: str = "./pretrained_model-teacherforcing-value"
+    save_dir: str = "./pretrained_model-onlyaction-head"
     log_interval: int = 200
     save_interval: int = 1000
     

@@ -334,10 +334,11 @@ class MassSelfiesED(nn.Module):
         self,
         spectrum_embed: torch.Tensor,
         tgt_tokens: torch.Tensor,
-        tgt_mask: torch.Tensor
-    ) -> torch.Tensor:
+        tgt_mask: torch.Tensor,
+        return_value: bool = True
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: # return logits or (logits, values)
         """
-        forward for logits
+        forward for logits and value (if return_value=True)
         
         Args:
             spectrum_embed: (B, spectrum_dim) fingerprint 4096
@@ -346,6 +347,7 @@ class MassSelfiesED(nn.Module):
             
         Returns:
             torch.Tensor: (B, T, vocab_size) logits for each position
+            or Tuple[torch.Tensor, torch.Tensor]: (B, T, vocab_size), (B, T, 1)
         """
         spectrum_embed = spectrum_embed.to(self.device)
         tgt_tokens = tgt_tokens.long().to(self.device)
@@ -364,13 +366,19 @@ class MassSelfiesED(nn.Module):
             tgt=dec_in, 
             memory=memory,
             tgt_mask=causal,
-            tgt_key_padding_mask=(tgt_mask == 0)
+            tgt_key_padding_mask=(tgt_mask == 0).bool()
         )  # (B, T, embed_dim)
 
-
+        # Action logits for each position
         logits = self.action_head(dec_out)  # (B, T, vocab_size)
         
-        return logits
+        if not return_value:
+            return logits
+        
+        # Value prediction for each position  
+        values = self.value_head(dec_out)  # (B, T, 1)
+        
+        return logits, values
 
     def forward(
         self,
@@ -395,7 +403,7 @@ class MassSelfiesED(nn.Module):
         dec_out  = self.decoder(
             tgt=dec_in, memory=memory,
             tgt_mask=causal,
-            tgt_key_padding_mask=(tgt_mask==0)
+            tgt_key_padding_mask=(tgt_mask==0).bool()
         )
         last     = dec_out[:, -1, :]
 

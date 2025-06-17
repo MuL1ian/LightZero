@@ -208,7 +208,7 @@ def evaluate_selfies_exact_match(model, config, test_data_file, device, batch_si
     
     total_samples = 0
     exact_matches = 0
-    chemical_equivalents = 0  # 添加化学等价性统计
+    chemical_equivalents = 0
     partial_matches = 0
     generation_failures = 0
     
@@ -243,7 +243,6 @@ def evaluate_selfies_exact_match(model, config, test_data_file, device, batch_si
                     best_candidate_selfies = ""
                     best_similarity_score = 0.0
                     
-                    # 检查所有候选结果，找到最好的匹配
                     for gen_selfies in generated_selfies_candidates:
                         exact_match, chem_equiv, partial_match, similarity = check_selfies_correctness(target_selfies, gen_selfies)
                         
@@ -308,7 +307,6 @@ def evaluate_selfies_exact_match(model, config, test_data_file, device, batch_si
                         best_candidate_selfies = ""
                         best_similarity_score = 0.0
                         
-                        # 检查所有候选结果，找到最好的匹配
                         for gen_selfies in generated_selfies_candidates_single:
                             exact_match, chem_equiv, partial_match, similarity = check_selfies_correctness(target_selfies, gen_selfies)
                             
@@ -469,7 +467,6 @@ def save_evaluation_results(eval_results, stats, model_path, test_data_file, sav
                 acc = match_stats['exact'] / match_stats['total'] * 100
                 f.write(f"  {length} tokens: {match_stats['exact']}/{match_stats['total']} = {acc:.1f}%\n")
         
-        # 添加Value Head评估结果
         if value_eval_results:
             f.write("\nValue Head evaluation results:\n")
             f.write(f"  total test samples: {value_eval_results['total_samples']:,}\n")
@@ -481,7 +478,6 @@ def save_evaluation_results(eval_results, stats, model_path, test_data_file, sav
             f.write(f"  positive samples: {value_eval_results['positive_samples']:,}\n")
             f.write(f"  negative samples: {value_eval_results['negative_samples']:,}\n")
         
-        # 添加badcase统计
         if error_counts:
             f.write(f"\nBadcase error type statistics:\n")
             total_errors = sum(error_counts.values())
@@ -497,13 +493,11 @@ def save_evaluation_results(eval_results, stats, model_path, test_data_file, sav
 
 
 def analyze_badcase(target_selfies, generated_selfies, formula):
-    """分析badcase的具体错误类型"""
     error_types = []
     
     if not generated_selfies or generated_selfies == "":
         return ["generation_failure"], "生成失败"
     
-    # 检查SELFIES语法有效性
     try:
         sf.decoder(generated_selfies)
         is_valid_selfies = True
@@ -511,7 +505,6 @@ def analyze_badcase(target_selfies, generated_selfies, formula):
         is_valid_selfies = False
         error_types.append("invalid_selfies")
     
-    # 长度分析
     target_tokens = list(sf.split_selfies(target_selfies))
     try:
         generated_tokens = list(sf.split_selfies(generated_selfies))
@@ -787,10 +780,9 @@ def check_selfies_correctness(target_selfies, generated_selfies):
     return False, is_chemically_equivalent, is_partial_match, similarity_score
 
 
-def generate_value_labels_for_gt_sequence(model, spectrum, input_ids, target_ids, attention_mask, tokenizer, device):
+def generate_value_labels_for_gt_sequence(model, spectrum, input_ids, attention_mask, tokenizer, device):
     """
     为真实序列生成value标签：基于模型预测的累积正确性
-    使用与训练时相同的logic：generate_teacher_forcing_value_labels
     """
     batch_size, seq_len = input_ids.shape
     
@@ -802,38 +794,24 @@ def generate_value_labels_for_gt_sequence(model, spectrum, input_ids, target_ids
         else:
             logits = output
     
-    # Get predicted tokens
-    predicted_tokens = torch.argmax(logits, dim=-1)  # (B, T)
+    # 生成value标签
+    value_labels = torch.zeros(batch_size, seq_len, device=device)
     
-    # Initialize value labels
-    value_labels = torch.zeros(batch_size, seq_len, dtype=torch.float, device=device)
-    pad_mask = (target_ids != tokenizer.pad_token_id).float()
-    
-    # For each sequence, compute cumulative correctness from right to left
     for b in range(batch_size):
-        # Find the last non-padding position
-        valid_positions = torch.where(target_ids[b] != tokenizer.pad_token_id)[0]
-        if len(valid_positions) == 0:
-            continue
-            
-        # Start from the right (end of sequence) and work backwards
+        # 对于每个序列，从右往左计算累积正确性
         cumulative_correct = True
-        for pos in range(len(valid_positions) - 1, -1, -1):
-            actual_pos = valid_positions[pos].item()
+        for t in range(seq_len - 1, -1, -1):  # 从最后一个位置往前
+            if t < seq_len - 1:  # 不是最后一个位置
+                # 检查当前位置的预测是否正确
+                predicted_token = torch.argmax(logits[b, t, :])
+                actual_next_token = input_ids[b, t + 1]
+                
+                # 如果预测错误，则累积正确性变为False
+                if predicted_token != actual_next_token:
+                    cumulative_correct = False
             
-            # Check if prediction at this position is correct
-            if predicted_tokens[b, actual_pos] == target_ids[b, actual_pos]:
-                # If we're still cumulative correct, this position gets 1
-                if cumulative_correct:
-                    value_labels[b, actual_pos] = 1.0
-                # else it stays 0 (already set)
-            else:
-                # Prediction is wrong, so cumulative correctness breaks
-                cumulative_correct = False
-                # This position and all previous positions get 0 (already set)
-    
-    # Apply padding mask
-    value_labels = value_labels * pad_mask
+            # 设置value标签
+            value_labels[b, t] = 1.0 if cumulative_correct else 0.0
     
     return value_labels
 
@@ -852,7 +830,9 @@ def evaluate_value_accuracy(model, config, test_data_file, device, batch_size=32
         max_len=config.max_len
     )
     
+    # 限制评估样本数量以加快速度
     if num_samples > 0 and num_samples < len(test_dataset):
+        # 随机采样指定数量的样本
         indices = torch.randperm(len(test_dataset))[:num_samples]
         test_subset = torch.utils.data.Subset(test_dataset, indices)
     else:
@@ -879,30 +859,35 @@ def evaluate_value_accuracy(model, config, test_data_file, device, batch_size=32
         for batch_idx, batch in enumerate(tqdm(test_loader, desc="评估value准确率")):
             spectrums = batch['spectrum'].to(device)
             input_ids = batch['input_ids'].to(device)
-            target_ids = batch['target_ids'].to(device)  # 获取正确的target_ids
             attention_mask = batch['attention_mask'].to(device)
             
             batch_size_actual = spectrums.size(0)
             
             try:
+                # 1. 生成真实value标签（基于模型预测的累积正确性）
                 value_labels = generate_value_labels_for_gt_sequence(
-                    model, spectrums, input_ids, target_ids, attention_mask, tokenizer, device
+                    model, spectrums, input_ids, attention_mask, tokenizer, device
                 )
                 
+                # 2. 获取模型的value预测
                 _, value_predictions = model.forward_pretrain(
                     spectrums, input_ids, attention_mask, return_value=True
                 )
                 
+                # 3. 计算准确率
                 value_preds_sigmoid = torch.sigmoid(value_predictions.squeeze(-1))  # (B, T)
                 value_pred_binary = (value_preds_sigmoid > 0.5).float()
                 
-                value_mask = (target_ids != tokenizer.pad_token_id).float()
+                # 创建mask，忽略pad tokens
+                value_mask = (input_ids != tokenizer.pad_token_id).float()
                 
+                # 计算正确预测的token数量
                 correct = (value_pred_binary == value_labels) * value_mask
                 correct_predictions += correct.sum().item()
                 total_tokens += value_mask.sum().item()
                 total_samples += batch_size_actual
                 
+                # 收集预测和标签用于详细分析
                 masked_predictions = value_preds_sigmoid * value_mask
                 masked_labels = value_labels * value_mask
                 
@@ -917,15 +902,19 @@ def evaluate_value_accuracy(model, config, test_data_file, device, batch_size=32
                 print(f"批次 {batch_idx} 处理失败: {e}")
                 continue
             
+            # 定期打印进度
             if (batch_idx + 1) % 10 == 0:
                 current_acc = correct_predictions / total_tokens * 100 if total_tokens > 0 else 0
                 print(f"  处理了 {total_samples:,} 个样本 - 当前Value准确率: {current_acc:.2f}%")
     
+    # 计算最终结果
     value_accuracy = correct_predictions / total_tokens * 100 if total_tokens > 0 else 0
     
+    # 详细分析
     value_predictions_all = np.array(value_predictions_all)
     value_labels_all = np.array(value_labels_all)
     
+    # 计算各种统计指标
     positive_samples = np.sum(value_labels_all == 1)
     negative_samples = np.sum(value_labels_all == 0)
     
@@ -940,6 +929,7 @@ def evaluate_value_accuracy(model, config, test_data_file, device, batch_size=32
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
     f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
     
+    # 平均预测值
     avg_prediction = np.mean(value_predictions_all)
     avg_positive_prediction = np.mean(value_predictions_all[value_labels_all == 1]) if positive_samples > 0 else 0
     avg_negative_prediction = np.mean(value_predictions_all[value_labels_all == 0]) if negative_samples > 0 else 0
@@ -999,7 +989,7 @@ def main():
     # Value评估相关参数
     parser.add_argument("--evaluate_value", action="store_true", default=True,
                        help="是否评估value head的准确率")
-    parser.add_argument("--value_eval_samples", type=int, default=0,
+    parser.add_argument("--value_eval_samples", type=int, default=1000,
                        help="用于value评估的样本数量 (0表示使用全部测试集)")
     
     parser.add_argument("--save_results", action="store_true", default=True,

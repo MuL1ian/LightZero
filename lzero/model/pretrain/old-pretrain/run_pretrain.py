@@ -17,6 +17,7 @@ import time
 import random
 
 from lzero.model.muzero_transformer import MassSelfiesED, SelfiesTokenizer
+from lzero.model.muzero_transformer import get_actions_list
 from config import PretrainConfig
 
 
@@ -245,90 +246,93 @@ def create_model(config: PretrainConfig) -> MassSelfiesED:
         device=config.device
     )
 
-# not check 
-def generate_teacher_forcing_value_labels(
-    model: MassSelfiesED,
-    spectrum: torch.Tensor,
+# not check  (no use as i dont train value head this time)
+def create_token_level_corrupted_sequences(
     input_ids: torch.Tensor, 
-    target_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    tokenizer,
-    add_noise: bool = False,
-    noise_prob: float = 0.1
-) -> torch.Tensor:
+    target_ids: torch.Tensor, 
+    tokenizer, 
+    corruption_prob: float = 0.5,
+    corruption_ratio: float = 0.2
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Generate value labels based on model's teacher forcing accuracy.
-    Value labels indicate whether the model can correctly predict subsequent tokens.
+    Create corrupted SELFIES sequences using only random token replacement.
+    Each sequence is corrupted at most once to maintain attention mask consistency.
     
     Args:
-        model: The transformer model
-        spectrum: (B, spectrum_dim) spectrum embeddings
-        input_ids: (B, T) input sequence [SOS, token1, token2, ...]
-        target_ids: (B, T) target sequence [token1, token2, ..., EOS]  
-        attention_mask: (B, T) attention mask
+        input_ids: (B, T) original input sequence
+        target_ids: (B, T) original target sequence  
         tokenizer: SELFIES tokenizer
-        add_noise: whether to add noise to value labels for robustness
-        noise_prob: probability of flipping correct predictions to incorrect
+        corruption_prob: probability of corrupting each sequence
+        corruption_ratio: ratio of tokens to be corrupted in each sequence
         
     Returns:
-        value_labels: (B, T) - 1 if can generate correctly from this position, 0 otherwise
+        corrupted_input_ids: (B, T) corrupted input sequence
+        corrupted_target_ids: (B, T) corrupted target sequence
+        value_labels: (B, T) - token-level labels: 1 if prefix matches original, 0 otherwise
     """
     batch_size, seq_len = input_ids.shape
     device = input_ids.device
+    pad_id = tokenizer.pad_token_id
+    vocab_size = len(tokenizer.get_vocab())
     
-    # Get model predictions for the GT sequence
-    with torch.no_grad():
-        logits = model.forward_pretrain(spectrum, input_ids, attention_mask, return_value=False)
-        if isinstance(logits, tuple):
-            logits = logits[0]
+    # Get special token IDs to avoid using them for corruption
+    special_token_ids = {tokenizer.sos_token_id, tokenizer.eos_token_id, 
+                        tokenizer.pad_token_id, tokenizer.unk_token_id}
+    valid_token_ids = [i for i in range(vocab_size) if i not in special_token_ids]
     
-    # Get predicted tokens
-    predicted_tokens = torch.argmax(logits, dim=-1)  # (B, T)
+    # Ensure we have valid tokens for corruption
+    if len(valid_token_ids) == 0:
+        raise ValueError("No valid tokens available for corruption!")
+
+    corrupted_input_ids = input_ids.clone()
+    corrupted_target_ids = target_ids.clone()
     
-    # Initialize value labels
-    value_labels = torch.zeros(batch_size, seq_len, dtype=torch.float, device=device)
-    pad_mask = (target_ids != tokenizer.pad_token_id).float()
-    
-    # For each sequence, compute cumulative correctness from right to left
-    for b in range(batch_size):
-        # Find the last non-padding position
-        valid_positions = torch.where(target_ids[b] != tokenizer.pad_token_id)[0]
-        if len(valid_positions) == 0:
-            continue
+    # Initialize all labels as 1 (correct)
+    pad_mask = (target_ids != pad_id).float()
+    value_labels = torch.ones_like(target_ids, dtype=torch.float, device=device)
+
+    for i in range(batch_size):
+        if random.random() < corruption_prob:
+            # Find valid token positions (non-padding, non-special tokens)
+            valid_mask = (target_ids[i] != pad_id)
+            valid_positions = torch.where(valid_mask)[0]
             
-        # Start from the right (end of sequence) and work backwards
-        cumulative_correct = True
-        for pos in range(len(valid_positions) - 1, -1, -1):
-            actual_pos = valid_positions[pos].item()
+            if len(valid_positions) == 0:
+                continue
+
+            # Choose random position to start corruption
+            corruption_start_idx = random.randint(0, len(valid_positions) - 1)
+            corruption_start_pos = valid_positions[corruption_start_idx].item()
             
-            # Check if prediction at this position is correct
-            if predicted_tokens[b, actual_pos] == target_ids[b, actual_pos]:
-                # If we're still cumulative correct, this position gets 1
-                if cumulative_correct:
-                    value_labels[b, actual_pos] = 1.0
-                # else it stays 0 (already set)
-            else:
-                # Prediction is wrong, so cumulative correctness breaks
-                cumulative_correct = False
-                # This position and all previous positions get 0 (already set)
-    
-    # Add noise for robustness (randomly flip some correct predictions to incorrect)
-    if add_noise and noise_prob > 0:
-        noise_mask = torch.rand_like(value_labels) < noise_prob
-        # Only flip 1s to 0s (correct to incorrect), not the other way around
-        flip_mask = noise_mask & (value_labels == 1.0) & (pad_mask == 1.0)
-        value_labels[flip_mask] = 0.0
-    
-    # Apply padding mask
+            # Calculate how many tokens to corrupt from this position
+            remaining_valid_tokens = len(valid_positions) - corruption_start_idx
+            num_corruptions = max(1, min(remaining_valid_tokens, 
+                                       int(len(valid_positions) * corruption_ratio)))
+            
+            # Corrupt consecutive tokens starting from corruption_start_pos
+            for j in range(num_corruptions):
+                pos = corruption_start_pos + j
+                if pos < seq_len and target_ids[i, pos] != pad_id:
+                    # Replace with random token
+                    random_token = random.choice(valid_token_ids)
+                    corrupted_target_ids[i, pos] = random_token
+                    
+                    # Update input_ids accordingly (shift by 1 due to teacher forcing)
+                    if pos > 0:
+                        corrupted_input_ids[i, pos] = random_token
+            
+            # Mark all positions from corruption start onwards as 0 (incorrect)
+            value_labels[i, corruption_start_pos:] = 0.0
+
+    # Apply padding mask to value labels
     value_labels = value_labels * pad_mask
-    
-    return value_labels
+
+    return corrupted_input_ids, corrupted_target_ids, value_labels
 
 def pretrain_step(model: MassSelfiesED, batch: Dict[str, torch.Tensor], 
                  loss_fn: PretrainLoss, device: str, tokenizer: SelfiesTokenizer = None,
                  train_value_head: bool = True, global_step: int = 0,
-                 add_noise_to_value_labels: bool = False, value_noise_prob: float = 0.1,
-                 value_warmup_steps: int = 3000, enable_value_warmup: bool = True) -> Tuple[torch.Tensor, Dict[str, float]]:
+                 corruption_prob: float = 0.5, corruption_ratio: float = 0.2) -> Tuple[torch.Tensor, Dict[str, float]]:
 
 
     spectrum = batch['spectrum'].to(device)
@@ -336,32 +340,34 @@ def pretrain_step(model: MassSelfiesED, batch: Dict[str, torch.Tensor],
     target_ids = batch['target_ids'].to(device)
     attention_mask = batch['attention_mask'].to(device)
     
-    # Value warmup logic: train only policy for first value_warmup_steps
-    should_train_value = train_value_head
-    if enable_value_warmup and global_step < value_warmup_steps:
-        should_train_value = False
-    
-    # Single forward pass with GT sequences for both policy and value training
-    if should_train_value:
-        # Forward pass that returns both policy logits and value predictions
-        policy_logits, value_predictions = model.forward_pretrain(
-            spectrum, input_ids, attention_mask, return_value=True
+    # Prepare data based on whether we're training value head
+    if train_value_head:
+        # Create corrupted sequences for value training using new token-level function
+        corrupted_input_ids, corrupted_target_ids, token_value_labels = create_token_level_corrupted_sequences(
+            input_ids, target_ids, tokenizer, corruption_prob, corruption_ratio
         )
         
-        # Generate value labels based on model's teacher forcing accuracy
-        token_value_labels = generate_teacher_forcing_value_labels(
-            model, spectrum, input_ids, target_ids, attention_mask, tokenizer,
-            add_noise=add_noise_to_value_labels, noise_prob=value_noise_prob
+        # Separate forward passes to avoid interference
+        # 1. Policy Head: Train with GT sequences
+        policy_logits = model.forward_pretrain(
+            spectrum, input_ids, attention_mask, return_value=False
         )
-    else:
-        # Only policy training
+        
+        # 2. Value Head: Train with corrupted sequences  
+        _, value_predictions = model.forward_pretrain(
+            spectrum, corrupted_input_ids, attention_mask, return_value=True
+        )
+        
+        # Use GT targets for policy, corrupted targets for value consistency
+        policy_target_ids = target_ids
+        value_target_ids = corrupted_target_ids
+    else: (only here i dont train value head)
+        # Only policy training - single forward pass with GT sequences
         policy_logits = model.forward_pretrain(spectrum, input_ids, attention_mask, return_value=False)
         value_predictions = None
         token_value_labels = None
-    
-    # Both policy and value use GT targets for consistency
-    policy_target_ids = target_ids
-    value_target_ids = target_ids
+        policy_target_ids = target_ids
+        value_target_ids = None
     
     # 1. Calculate Policy Loss (always on GT targets)
     policy_loss = loss_fn.lm_loss_fn(
@@ -386,7 +392,7 @@ def pretrain_step(model: MassSelfiesED, batch: Dict[str, torch.Tensor],
     value_accuracy = 0.0
     avg_value_pred = 0.0
     
-    if should_train_value and value_predictions is not None:
+    if train_value_head and value_predictions is not None:
         # Use the unified loss function for value loss calculation
         value_loss_dict = loss_fn(
             logits=torch.zeros_like(policy_logits),  # dummy logits, only compute value loss
@@ -604,24 +610,13 @@ def pretrain_transformer(config: PretrainConfig):
     print(f"🔄 Total steps: {total_steps:,}")
     
     print(f"\n📚 Training mode: Combined Policy + Value Training")
-    print(f"    Policy Head: GT sequences → Action prediction") 
-    print(f"    Value Head: GT sequences → Teacher forcing accuracy prediction")
+    print(f"    Policy Head: GT sequences → Action prediction")
+    print(f"    Value Head: Corrupted sequences → Quality evaluation")
     print(f"    Single optimization step with combined loss")
     
     if config.train_value_head:
         print(f"🎯 Value head training enabled (weight: {config.value_loss_weight})")
-        print(f"🎯 Value training strategy: {config.value_training_strategy}")
-        if config.add_noise_to_value_labels:
-            print(f"🎲 Value label noise enabled: prob={config.value_noise_prob}")
-        print(f"💡 Value predicts: 'Can generate correctly from this position'")
-        
-        # Value warmup information
-        if config.enable_value_warmup:
-            print(f"🔥 Value warmup enabled: {config.value_warmup_steps} steps")
-            print(f"    First {config.value_warmup_steps} steps: Policy only")
-            print(f"    After step {config.value_warmup_steps}: Policy + Value")
-        else:
-            print(f"🔥 Value warmup disabled: Training value from step 0")
+        print(f"🎲 Sequence corruption: prob={config.corruption_prob}, ratio={config.corruption_ratio}")
     else:
         print(f"📝 Language modeling only")
     
@@ -640,10 +635,7 @@ def pretrain_transformer(config: PretrainConfig):
             
             loss, metrics = pretrain_step(model, batch, loss_fn, config.device, tokenizer, 
                                         train_value_head=config.train_value_head, global_step=global_step,
-                                        add_noise_to_value_labels=config.add_noise_to_value_labels, 
-                                        value_noise_prob=config.value_noise_prob,
-                                        value_warmup_steps=config.value_warmup_steps,
-                                        enable_value_warmup=config.enable_value_warmup)
+                                        corruption_prob=config.corruption_prob, corruption_ratio=config.corruption_ratio)
             stage_info = "TEACHER_FORCE"
             
             # backward pass
@@ -664,12 +656,8 @@ def pretrain_transformer(config: PretrainConfig):
                     epoch_metrics[key].append(value)
             
             # update progress bar
-            # Determine training mode based on warmup status
-            is_in_warmup = config.enable_value_warmup and global_step < config.value_warmup_steps
-            training_mode = 'P_WARMUP' if is_in_warmup else 'P+V_TRAIN'
-            
             postfix_dict = {
-                'mode': training_mode,
+                'mode': 'P+V_TRAIN',  # Policy + Value training
                 'loss': f"{loss.item():.4f}",
                 'p_loss': f"{metrics['policy_loss']:.4f}",  # policy loss
                 'acc': f"{metrics['accuracy']:.4f}",
@@ -677,8 +665,8 @@ def pretrain_transformer(config: PretrainConfig):
                 'lr': f"{scheduler.get_lr():.2e}"
             }
             
-            # add value metrics if available (only when not in warmup)
-            if not is_in_warmup and 'value_loss' in metrics and metrics['value_loss'] > 0:
+            # add value metrics if available
+            if 'value_loss' in metrics and metrics['value_loss'] > 0:
                 postfix_dict['v_loss'] = f"{metrics['value_loss']:.4f}"
                 postfix_dict['v_acc'] = f"{metrics.get('value_accuracy', 0):.3f}"
             
@@ -689,10 +677,6 @@ def pretrain_transformer(config: PretrainConfig):
             pbar.set_postfix(postfix_dict)
             
             global_step += 1
-            
-            # Check if we just finished warmup
-            if config.enable_value_warmup and global_step == config.value_warmup_steps:
-                print(f"\n🎯 Value warmup completed at step {global_step}! Starting value head training...")
             
             if global_step % config.log_interval == 0:
                 current_lr = scheduler.get_lr()
@@ -714,16 +698,6 @@ def pretrain_transformer(config: PretrainConfig):
                     avg_eos_acc = np.mean([m['eos_accuracy'] for m in recent_metrics])
                     eos_log_str = f", pred_eos={avg_pred_eos:.1f}%, target_eos={avg_target_eos:.1f}%, eos_acc={avg_eos_acc:.1f}%"
                 
-                # Add value warmup progress info
-                warmup_info = ""
-                if config.enable_value_warmup and config.train_value_head:
-                    if global_step < config.value_warmup_steps:
-                        progress = (global_step / config.value_warmup_steps) * 100
-                        remaining_steps = config.value_warmup_steps - global_step
-                        warmup_info = f" [WARMUP: {progress:.1f}%, {remaining_steps} steps remain]"
-                    else:
-                        warmup_info = " [VALUE_TRAINING_ACTIVE]"
-                
                 if log_training_step_fn:
                     log_training_step_fn(
                         epoch=epoch + 1,
@@ -734,7 +708,7 @@ def pretrain_transformer(config: PretrainConfig):
                         early_stopping_counter=patience_counter
                     )
                 
-                print(f"📈 Step {global_step}: loss={avg_recent_loss:.4f}, lr={current_lr:.2e}{eos_log_str}{warmup_info}")
+                print(f"📈 Step {global_step}: loss={avg_recent_loss:.4f}, lr={current_lr:.2e}{eos_log_str}")
             
             # save checkpoint and validation
             if global_step % config.save_interval == 0:
@@ -754,10 +728,7 @@ def pretrain_transformer(config: PretrainConfig):
                         for batch in tqdm(val_loader, desc="Validation", leave=False):
                             loss, metrics = pretrain_step(model, batch, loss_fn, config.device, tokenizer,
                                                          train_value_head=config.train_value_head, global_step=global_step,
-                                                         add_noise_to_value_labels=config.add_noise_to_value_labels, 
-                                                         value_noise_prob=config.value_noise_prob,
-                                                         value_warmup_steps=config.value_warmup_steps,
-                                                         enable_value_warmup=config.enable_value_warmup)
+                                                         corruption_prob=config.corruption_prob, corruption_ratio=config.corruption_ratio)
                             val_losses.append(loss.item())
                             for key, value in metrics.items():
                                 if key in val_metrics:
@@ -780,26 +751,10 @@ def pretrain_transformer(config: PretrainConfig):
                     
                     training_stats['val_losses'].append(current_val_loss)
                     
-                    # Determine warmup status for validation display
-                    val_warmup_status = ""
-                    if config.enable_value_warmup and config.train_value_head:
-                        if global_step < config.value_warmup_steps:
-                            progress = (global_step / config.value_warmup_steps) * 100
-                            val_warmup_status = f" [Policy-only warmup: {progress:.1f}%]"
-                        else:
-                            val_warmup_status = " [Policy + Value training]"
-                    
-                    print(f"📊 Validation Results - Step {global_step}{val_warmup_status}:")
+                    print(f"📊 Validation Results - Step {global_step}:")
                     print(f"    Loss: {current_val_loss:.4f}")
                     print(f"    Accuracy: {avg_val_metrics['accuracy']:.4f}")
                     print(f"    Perplexity: {val_perplexity:.2f}")
-                    
-                    # Only show value metrics when value training is active
-                    if not (config.enable_value_warmup and global_step < config.value_warmup_steps):
-                        if 'value_loss' in avg_val_metrics and avg_val_metrics['value_loss'] > 0:
-                            print(f"    Value Loss: {avg_val_metrics['value_loss']:.4f}")
-                            print(f"    Value Accuracy: {avg_val_metrics['value_accuracy']:.4f}")
-                    
                     if 'pred_eos_rate' in avg_val_metrics:
                         print(f"    Target EOS Rate: {avg_val_metrics['target_eos_rate']:.1f}%")
                         print(f"    Predicted EOS Rate: {avg_val_metrics['pred_eos_rate']:.1f}%")
@@ -837,8 +792,7 @@ def pretrain_transformer(config: PretrainConfig):
                                 'global_step': global_step,
                                 'val_loss': current_val_loss,
                                 'tokenizer_vocab': tokenizer.get_vocab(),
-                                'training_stats': training_stats,
-                                'value_warmup_completed': global_step >= config.value_warmup_steps if config.enable_value_warmup else True
+                                'training_stats': training_stats
                             }
                             torch.save(best_checkpoint, os.path.join(config.save_dir, "best_model.pt"))
                             print(f"🌟 Saved new best model with val_loss: {current_val_loss:.4f}")

@@ -1,0 +1,5 @@
+1. please rerun the `encoder-pretrain` code, as i now filter out all the cases that contain invaild tokens (tokens not in the extenedn selfeis tokenizers ) inside train and validation dataset, test dataset remain the same.
+
+2. Under the old-pretrain is the original training and coressponding config, i add the value head training but not worked well so i only train the action head, for all the config like batch size, trian value head or not are all in `config.py` simply run the `python run_pretrian.py` after edit the `config.py` should worked well. all inside `old-pretrain folder`
+
+3.  In the `pretrain` foler is the new version of training that I train both action adn value head, and silght difference is this training trained value head base on predict furture correctess given current situation. (in old pretrian is judge whatever the current selfies up to here is correct or not ) so silight difference. change the config in `pretrain` (here) and run the `run_pretrain.py` in this folder is the new version of code.

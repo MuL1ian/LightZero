@@ -191,27 +191,40 @@ class ChemicalFormulaTokenizer:
 
 # -----------------------------------------------------------------------------
 # Encoder-Decoder Transformer
+# Now is decoder only Transformer (06 12 2025)
 # -----------------------------------------------------------------------------
 class MassSelfiesED(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        max_len: int = 128,
-        d_model=512,
-        n_enc=4,
-        n_dec=6,
-        n_head=8,
+        max_len: int = 120,
+        n_dec=12, 
         dropout=0.1,
-        n_spectrum_heads=32,
+        spectrum_chunk_size=256, # each chunk size  
+        spectrum_attention_heads=4, # attention heads for spectrum decomposer
+        n_head=16, # heads for main transformer decoder
+        d_model=512, # dimension of the model
         device="cuda",
     ):
         super().__init__()
+
         self.device = torch.device(device)
         self.spectrum_dim = 4096
+        self.spectrum_chunk_size = spectrum_chunk_size
+        self.spectrum_attention_heads = spectrum_attention_heads  # 清晰命名
+        self.n_head = n_head
+        self.d_model = d_model
+
+        self.num_chunks = self.spectrum_dim // self.spectrum_chunk_size # how many chunks 
+
         # tokenizer for special ids and pad
         self.tokenizer = SelfiesTokenizer(max_len=max_len)
-        # Simplified: vocab_size = action_space_size, action_index = token_id
-        self.vocab_size = len(self.tokenizer.get_vocab())
+
+        # compute action_token_ids from global actions_list
+        global actions_list
+        if actions_list is None:
+            actions_list = get_actions_list()
+        self.action_token_ids = [self.tokenizer.token_to_id(tok) for tok in actions_list]
 
         # record special token ids
         self.pad_token_id = self.tokenizer.pad_token_id
@@ -219,82 +232,102 @@ class MassSelfiesED(nn.Module):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.unk_token_id = self.tokenizer.unk_token_id
 
-        # Enhanced Encoder for spectrum with multi-head self-attention
-        self.n_spectrum_heads = n_spectrum_heads 
-        assert d_model % self.n_spectrum_heads == 0, f"d_model {d_model} must be divisible by n_spectrum_heads {self.n_spectrum_heads}"
-        self.spectrum_head_dim = d_model // self.n_spectrum_heads
-        
-        # Project spectrum to multi-head format
-        self.spec_proj = nn.Sequential(
-            nn.Linear(self.spectrum_dim, d_model * self.n_spectrum_heads),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Spectrum self-attention layer
-        self.spectrum_self_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_head,
+        # Token embeddings for SELFIES
+        self.token_embed = nn.Embedding(vocab_size, self.d_model)
+        self.pos_embed   = nn.Embedding(max_len, self.d_model)
+ 
+
+
+        # Multi-head self-attention for spectrum decomposition
+        self.spectrum_decomposer = nn.MultiheadAttention(
+            embed_dim=self.spectrum_chunk_size,  # 256
+            num_heads=self.spectrum_attention_heads,  # 4
             dropout=dropout,
             batch_first=True
         )
-        
-        # Spectrum encoder layers
-        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head,
-                                               dropout=dropout, batch_first=True)
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_enc)
 
-        # Decoder
-        self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed   = nn.Embedding(max_len, d_model)
-        dec_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=n_head,
-                                               dropout=dropout, batch_first=True)
+        # Projection from chunk_size to d_model
+        self.chunk_to_model_proj = nn.Linear(self.spectrum_chunk_size, self.d_model) 
+        
+        # Decoder Only
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=self.d_model,  
+            nhead=self.n_head,
+            dropout=dropout, 
+            batch_first=True
+        )
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_dec)
 
+<<<<<<< HEAD
         # Heads - output full vocabulary size since action_index = token_id
         self.action_head = nn.Linear(d_model, vocab_size, bias=False)
         self.value_head  = nn.Sequential(nn.Linear(d_model, d_model), nn.Tanh(), nn.Linear(d_model, 1))
+=======
+        # Outputs Heads
+        self.action_head = nn.Linear(self.d_model, vocab_size, bias=False)
+        self.value_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model), 
+            nn.Tanh(), 
+            nn.Linear(self.d_model, 1)
+        )
+>>>>>>> 458e2b62532f853ada563c7fafe3a977da2d5c4c
         self.to(self.device)
 
     def _generate_square_subsequent_mask(self, sz: int) -> torch.Tensor:
         return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
 
+    def _prepare_spectrum_memory(self, spectrum_embed: torch.Tensor) -> torch.Tensor:
+        """
+        Spectrum embedding is decomposed using direct chunking and self-attention is applied.
+        
+        Args:
+            spectrum_embed: (B, spectrum_dim) spectrum embedding
+            
+        Returns:
+            torch.Tensor: (B, spectrum_heads, d_model) spectrum memory
+        """
+        batch_size = spectrum_embed.size(0)
+        
+        spectrum_sequence = spectrum_embed.view(batch_size, self.num_chunks, self.spectrum_chunk_size)
+        
+        # Apply multi-head self-attention to spectrum chunks
+        spectrum_attended, _ = self.spectrum_decomposer(
+            query=spectrum_sequence,
+            key=spectrum_sequence, 
+            value=spectrum_sequence
+        )  # [batch_size, num_chunks, chunk_size]
+        
+        # Project to model dimension
+        spectrum_memory = self.chunk_to_model_proj(spectrum_attended) # [batch_size, num_chunks, d_model]
+
+        return spectrum_memory
+
     def forward_pretrain(
         self,
         spectrum_embed: torch.Tensor,
         tgt_tokens: torch.Tensor,
-        tgt_mask: torch.Tensor
-    ) -> torch.Tensor:
+        tgt_mask: torch.Tensor,
+        return_value: bool = True
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: # return logits or (logits, values)
         """
-        前向传播用于预训练 - 返回完整序列的logits
+        forward for logits and value (if return_value=True)
         
         Args:
-            spectrum_embed: (B, spectrum_dim) 质谱嵌入
-            tgt_tokens: (B, T) 目标token序列
+            spectrum_embed: (B, spectrum_dim) fingerprint 4096
+            tgt_tokens: (B, T) tgt selfies tokens
             tgt_mask: (B, T) attention mask
             
         Returns:
-            torch.Tensor: (B, T, vocab_size) 每个位置的logits
+            torch.Tensor: (B, T, vocab_size) logits for each position
+            or Tuple[torch.Tensor, torch.Tensor]: (B, T, vocab_size), (B, T, 1)
         """
         spectrum_embed = spectrum_embed.to(self.device)
         tgt_tokens = tgt_tokens.long().to(self.device)
         tgt_mask = tgt_mask.to(self.device)
         B, T = tgt_tokens.shape
 
-        # Enhanced Encoder with multi-head spectrum processing
-        # Project spectrum to multi-head format
-        spec_projected = self.spec_proj(spectrum_embed)  # (B, d_model * n_spectrum_heads)
-        
-        # Reshape to multi-head format
-        spec_multihead = spec_projected.view(B, self.n_spectrum_heads, -1)  # (B, n_spectrum_heads, d_model)
-        
-        # Apply self-attention across spectrum heads
-        spec_attended, _ = self.spectrum_self_attn(
-            spec_multihead, spec_multihead, spec_multihead
-        )  # (B, n_spectrum_heads, d_model)
-        
-        # Use the attended spectrum as memory for decoder
-        mem = self.encoder(spec_attended)  # (B, n_spectrum_heads, d_model)
+        spectrum_memory = self._prepare_spectrum_memory(spectrum_embed)  # (B, spectrum_heads, d_model)
+        memory = spectrum_memory  # (B, spectrum_heads, d_model)
 
         # Decoder
         pos_ids = torch.arange(T, device=self.device).unsqueeze(0).expand(B, -1)
@@ -303,15 +336,21 @@ class MassSelfiesED(nn.Module):
         
         dec_out = self.decoder(
             tgt=dec_in, 
-            memory=mem,
+            memory=memory,
             tgt_mask=causal,
-            tgt_key_padding_mask=(tgt_mask == 0)
-        )  # (B, T, d_model)
+            tgt_key_padding_mask=(tgt_mask == 0).bool()
+        )  # (B, T, embed_dim)
 
-        # 获取每个位置的logits
+        # Action logits for each position
         logits = self.action_head(dec_out)  # (B, T, vocab_size)
         
-        return logits
+        if not return_value:
+            return logits
+        
+        # Value prediction for each position  
+        values = self.value_head(dec_out)  # (B, T, 1)
+        
+        return logits, values
 
     def forward(
         self,
@@ -325,29 +364,18 @@ class MassSelfiesED(nn.Module):
         tgt_mask   = tgt_mask.to(self.device)
         B, T = tgt_tokens.shape
 
-        # Enhanced Encoder with multi-head spectrum processing
-        # Project spectrum to multi-head format
-        spec_projected = self.spec_proj(spectrum_embed)  # (B, d_model * n_spectrum_heads)
+        spectrum_memory = self._prepare_spectrum_memory(spectrum_embed)  # (B, spectrum_heads, d_model)
         
-        # Reshape to multi-head format
-        spec_multihead = spec_projected.view(B, self.n_spectrum_heads, -1)  # (B, n_spectrum_heads, d_model)
-        
-        # Apply self-attention across spectrum heads
-        spec_attended, _ = self.spectrum_self_attn(
-            spec_multihead, spec_multihead, spec_multihead
-        )  # (B, n_spectrum_heads, d_model)
-        
-        # Use the attended spectrum as memory for decoder
-        mem = self.encoder(spec_attended)  # (B, n_spectrum_heads, d_model)
+        memory = spectrum_memory  # (B, spectrum_heads, d_model)
 
         # Decoder
         pos_ids  = torch.arange(T, device=self.device).unsqueeze(0)
         dec_in   = self.token_embed(tgt_tokens) + self.pos_embed(pos_ids)
         causal   = self._generate_square_subsequent_mask(T).to(self.device)
         dec_out  = self.decoder(
-            tgt=dec_in, memory=mem,
+            tgt=dec_in, memory=memory,
             tgt_mask=causal,
-            tgt_key_padding_mask=(tgt_mask==0)
+            tgt_key_padding_mask=(tgt_mask==0).bool()
         )
         last     = dec_out[:, -1, :]
 

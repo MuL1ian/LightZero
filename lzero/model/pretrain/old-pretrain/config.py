@@ -31,17 +31,13 @@ class PretrainConfig:
     weight_decay: float = 0.02    
     
     # Value head training parameters
-    train_value_head: bool = True               # whether to train value head
-    value_loss_weight: float = 0.2             # weight for value loss
+    # i dont train value for this config
+    train_value_head: bool = False              # whether to train value head
+    value_loss_weight: float = 0.5             # weight for value loss
     
-    # Value warmup parameters
-    enable_value_warmup: bool = True           # whether to enable value training warmup
-    value_warmup_steps: int = 2000             # number of steps to warmup value training (policy trains alone first)
-    
-    # Value training strategy parameters
-    value_training_strategy: str = "teacher_forcing"  # "teacher_forcing" or "corrupted_sequences"
-    add_noise_to_value_labels: bool = True      # add noise to value labels for robustness
-    value_noise_prob: float = 0.1              # probability of flipping value labels
+    # Sequence corruption parameters for value head training
+    corruption_prob: float = 0.5               # corruption probability for each sequence
+    corruption_ratio: float = 0.2              # corruption ratio for each sequence
     
     # Early stopping
     early_stopping_patience: int = 8
@@ -52,7 +48,7 @@ class PretrainConfig:
     spectrum_dim: int = 4096
     
     # Save parameters
-    save_dir: str = "./pretrained_model-teacherforcing-value"
+    save_dir: str = "./pretrained_model-onlyaction-head"
     log_interval: int = 200
     save_interval: int = 1000
     
@@ -60,23 +56,6 @@ class PretrainConfig:
     device: str = "cuda"
     
     # Dataset parameters
-<<<<<<< HEAD
-    train_data_file: str = "/home/zirui/MassEnv/DataLoader/train_spectrum_embeds_msg.pt"
-    val_data_file: str = "/home/zirui/MassEnv/DataLoader/val_spectrum_embeds_msg.pt"
-
-
-@dataclass
-class EvaluationConfig:
-    """Evaluation configuration"""
-    batch_size: int = 32
-    max_len: int = 120
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    k_predictions: int = 1
-    temperature: float = 0.0
-    test_data_file: str = "/home/zirui/MassEnv/DataLoader/test_spectrum_embeds_msg.pt"
-    results_dir: str = "./evaluation_results" 
-=======
     train_data_file: str = "/hy-tmp/MassEnv/DataLoader/train_spectrum_embeds_msg.pt"
     val_data_file: str = "/hy-tmp/MassEnv/DataLoader/val_spectrum_embeds_msg.pt"
 
->>>>>>> 458e2b62532f853ada563c7fafe3a977da2d5c4c

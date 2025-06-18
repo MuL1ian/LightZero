@@ -28,7 +28,7 @@ import warnings
 import torch
 import random
 from torch.utils.data import Dataset
-from zoo.masspecgym.envs.mass_tokenizers import SelfiesTokenizer
+from lzero.model.selfies_tokenizer import SelfiesTokenizer
 from zoo.masspecgym.envs.utils import (
     parse_formula_counts,
     extract_element_from_token,
@@ -51,6 +51,91 @@ except ImportError as e:
     GLOBAL_REWARD_AVAILABLE = False
     global_reward_network = None
     get_reward_function = lambda: lambda *args, **kwargs: 0.0
+
+# Add the prediction functions for dynamic episode length
+def parse_molecular_formula_for_atoms(formula):
+    """
+    Parse a molecular formula and count total atoms.
+    
+    Args:
+        formula (str): Molecular formula like 'C6H12O6'
+        
+    Returns:
+        int: Total number of atoms
+    """
+    if not formula or formula == '':
+        return 0
+    
+    # Remove any charges, brackets, or other symbols for counting
+    clean_formula = re.sub(r'[+\-\[\]()]', '', formula)
+    
+    # Find all element-count pairs
+    # Pattern matches: Capital letter, optional lowercase, optional digits
+    pattern = r'([A-Z][a-z]?)(\d*)'
+    matches = re.findall(pattern, clean_formula)
+    
+    total_atoms = 0
+    for element, count_str in matches:
+        count = int(count_str) if count_str else 1
+        total_atoms += count
+    
+    return total_atoms
+
+def predict_episode_length_from_formula(formula, safety_margin=1.1):
+    """
+    Predict episode length for a given molecular formula based on empirical analysis.
+    
+    Args:
+        formula (str): Molecular formula
+        safety_margin (float): Additional safety margin (default: 1.1 = 10% extra)
+        
+    Returns:
+        dict: Prediction results including recommended max_steps
+    """
+    try:
+        atom_count = parse_molecular_formula_for_atoms(formula)
+        
+        if atom_count == 0:
+            return {
+                'predicted_max_steps': 100,  # Default fallback
+                'atom_count': 0,
+                'predicted_tokens': 0,
+                'upper_bound_tokens': 0,
+                'error': 'Could not parse formula'
+            }
+        
+        # Empirically derived linear relationship from analysis
+        # y = 0.594x + 12.508 (mean prediction)
+        # y < 0.594x + 47.774 (99% upper bound)
+        slope = 0.594
+        intercept = 12.508
+        upper_bound_intercept = 47.774
+        
+        predicted = slope * atom_count + intercept
+        upper_bound = slope * atom_count + upper_bound_intercept
+        
+        # Add safety margin and buffer
+        safe_upper_bound = upper_bound * safety_margin
+        recommended_max_steps = int(safe_upper_bound) + 5  # Additional buffer
+        
+        return {
+            'predicted_max_steps': recommended_max_steps,
+            'atom_count': atom_count,
+            'predicted_tokens': predicted,
+            'upper_bound_tokens': upper_bound,
+            'safe_upper_bound': safe_upper_bound,
+            'linear_equation': f"y = 0.594 * {atom_count} + 12.508 = {predicted:.1f}",
+            'upper_bound_equation': f"y < 0.594 * {atom_count} + 47.774 = {upper_bound:.1f}"
+        }
+        
+    except Exception as e:
+        return {
+            'predicted_max_steps': 100,  # Default fallback
+            'atom_count': 0,
+            'predicted_tokens': 0,
+            'upper_bound_tokens': 0,
+            'error': str(e)
+        }
 
 # Import the proper dataset
 try:
@@ -600,7 +685,7 @@ bond_constraints = get_bond_constraints()
 # Example of bond constraints: {'N': 3, 'O': 2, 'P': 3, 'H': 1, 'B': 3, 'Br': 1, 'S': 2, 'C': 4, 'Cl': 1, 'F': 1, 'I': 1}
 
 
-selfies_tokenizer = SelfiesTokenizer(max_len=100)
+selfies_tokenizer = SelfiesTokenizer(max_len=150)
 
 
 
@@ -645,7 +730,7 @@ class MassGymEnv(gym.Env):
         branch_tokens=[],
         ring_tokens=[],
         
-        max_len=100,
+        max_len=150,
         formula_masking=True,
         formula_max_len=50,  # Maximum length for formula tokens
         debug=True,
@@ -761,6 +846,11 @@ class MassGymEnv(gym.Env):
             self.reward_function = None
         
         self.max_episode_steps = cfg.get('max_episode_steps', 100)
+        # Add dynamic episode length prediction
+        self.use_dynamic_max_steps = cfg.get('use_dynamic_max_steps', True)
+        self.dynamic_safety_margin = cfg.get('dynamic_safety_margin', 1.1)
+        self.predicted_max_steps = None  # Will be set dynamically based on target formula
+        
         self.is_collect = cfg.get('is_collect', True)
         self.ignore_legal_actions = cfg.get('ignore_legal_actions', False)
         self.need_flatten = cfg.get('need_flatten', False)
@@ -795,50 +885,27 @@ class MassGymEnv(gym.Env):
         # filter out valid atoms
         self.atom_tokens = filter_valid_atoms(self.atom_tokens)
         
-        # control tokens
-        self.remove_token = "<REMOVE>"
-        self.end_token = "<END>"
-
-                # Record tokenizer special tokens
-        self.tokenizer_special_tokens = [
-                self.tokenizer.pad_token,
-                self.tokenizer.sos_token,
-                self.tokenizer.eos_token,
-                self.tokenizer.unk_token
-        ]
+        # Simplified action space: directly use tokenizer vocabulary
+        # Action space size = vocabulary size, action index = token ID
+        self.vocab = self.tokenizer.get_vocab()
+        self.vocab_size = len(self.vocab)
         
-        # Include ALL tokens (including special tokens and hydrogen) to match vocabulary size
-        # This ensures action space size = vocabulary size = 75
-        # Add [H] explicitly since it may be filtered out but is in the vocabulary
-        additional_tokens = []
-        if '[H]' not in self.atom_tokens and '[H]' in self.tokenizer.get_vocab():
-            additional_tokens.append('[H]')
-            
-        self.actions_list = (self.atom_tokens + 
-                            self.bonded_atom_tokens +
-                            self.branch_tokens + 
-                            self.ring_tokens + 
-                            [self.end_token] +
-                            [self.remove_token] +
-                            self.tokenizer_special_tokens +
-                            additional_tokens
-                            )
+        # Get reverse mapping for debugging/display purposes
+        self.token_id_to_token = {v: k for k, v in self.vocab.items()}
         
-        vocab = self.tokenizer.get_vocab()
-        for action in self.actions_list:
-            if action not in vocab:
-                raise ValueError(f"Action {action} not in tokenizer vocabulary!")
+        # Store special token IDs for masking
+        self.pad_token_id = self.tokenizer.pad_token_id
+        self.sos_token_id = self.tokenizer.sos_token_id
+        self.eos_token_id = self.tokenizer.eos_token_id
+        self.unk_token_id = self.tokenizer.unk_token_id
+        
+        # Keep track of valid SELFIES tokens for action masking
+        self.valid_selfies_token_ids = set()
+        for token in self.atom_tokens + self.bonded_atom_tokens + self.branch_tokens + self.ring_tokens:
+            if token in self.vocab:
+                self.valid_selfies_token_ids.add(self.vocab[token])
 
-        # build the mapping between action and token id
-        action_token_ids = [self.tokenizer.token_to_id(tok) for tok in self.actions_list]
-        self.action_index2token_id = {
-            i: tid for i, tid in enumerate(action_token_ids)
-        }
-        self.token_id2action_index = {
-            tid: i for i, tid in enumerate(action_token_ids)
-        }
-
-        self.max_len = cfg.get('max_len', 100)
+        self.max_len = cfg.get('max_len', 150)
         
         
         self.episode_return = 0
@@ -847,7 +914,8 @@ class MassGymEnv(gym.Env):
         self._timestep = 0
 
         # set the action space and observation space for the gym interface
-        self._action_space = spaces.Discrete(len(self.actions_list))
+        # Action space size = vocabulary size, where action index = token ID
+        self._action_space = spaces.Discrete(self.vocab_size)
         
         self._reward_range = (0., 1.)
         
@@ -905,6 +973,25 @@ class MassGymEnv(gym.Env):
         
         self.random_massspecgym_data()
         
+        # Predict dynamic max steps based on target formula
+        if self.use_dynamic_max_steps and hasattr(self, 'target_spectrum'):
+            formula = self.target_spectrum.get('formulas', '')
+            if formula:
+                prediction = predict_episode_length_from_formula(formula, self.dynamic_safety_margin)
+                self.predicted_max_steps = prediction['predicted_max_steps']
+                
+                # Log prediction for debugging
+                if 'error' not in prediction:
+                    print(f"[INFO] Dynamic max_steps: {self.predicted_max_steps} for formula '{formula}' "
+                          f"({prediction['atom_count']} atoms, predicted tokens: {prediction['predicted_tokens']:.1f})")
+                else:
+                    print(f"[WARN] Formula prediction failed: {prediction['error']}, using default max_steps")
+                    self.predicted_max_steps = self.max_episode_steps
+            else:
+                self.predicted_max_steps = self.max_episode_steps
+        else:
+            self.predicted_max_steps = self.max_episode_steps
+        
         # Initialize atom tracking
         self.target_element_counts = parse_formula_counts(self.target_spectrum.get('formulas', ''))
         self.used_element_counts = {}
@@ -933,7 +1020,7 @@ class MassGymEnv(gym.Env):
         combined_obs = torch.cat([spectrum, token, formula_token_ids], dim=-1)
 
         # Calculate expected observation dimension
-        expected_dim = 4096 + self.max_len + self.formula_max_len  # 4096 + 100 + 50 = 4246
+        expected_dim = 4096 + self.max_len + self.formula_max_len  # 4096 + 150 + 50 = 4296
         
         obs_dict = {
             'observation': combined_obs,
@@ -1011,43 +1098,91 @@ class MassGymEnv(gym.Env):
     def get_valid_actions(self): 
         """
         Generate a boolean mask over the full action space indicating which actions are valid.
-        This does not change the size of the action space (always same as len(self.actions_list)).
+        Action space size = vocabulary size, where action index = token ID.
         """
-        formula = self.target_spectrum.get('formulas', '') if hasattr(self, 'target_spectrum') else ''
-        used_counts = getattr(self, 'used_element_counts', {})
+        # Initialize mask - all actions invalid by default
+        mask = np.zeros(self.vocab_size, dtype=np.bool_)
         
-        # Apply intelligent END token masking if enabled
+        # Always mask out special tokens except EOS (EOS can be used for termination)
+        mask[self.pad_token_id] = False
+        mask[self.sos_token_id] = False  
+        mask[self.unk_token_id] = False
+        
+        # Allow valid SELFIES tokens
+        for token_id in self.valid_selfies_token_ids:
+            mask[token_id] = True
+            
+        # Apply formula-based masking if enabled
+        if self.formula_masking and hasattr(self, 'target_spectrum'):
+            formula = self.target_spectrum.get('formulas', '')
+            used_counts = getattr(self, 'used_element_counts', {})
+            
+            if formula:
+                mask = self._apply_formula_masking(mask, formula, used_counts)
+        
+        # Apply intelligent EOS token masking
         if self.prevent_early_termination:
-            return get_action_mask(
-                formula=formula,
-                used_element_counts=used_counts,
-                actions_list=self.actions_list,
-                atom_tokens=self.atom_tokens,
-                bonded_atom_tokens=self.bonded_atom_tokens,
-                current_selfies=self.current_selfies,
-                formula_masking=self.formula_masking,
-                end_token=self.end_token,
-                remove_token=self.remove_token,
-                special_tokens=self.tokenizer_special_tokens,
-                min_formula_completion=self.min_formula_completion,
-                allow_early_end_after_steps=self.allow_early_end_after_steps
-            )
+            mask[self.eos_token_id] = self._should_allow_eos_token()
         else:
-            # Use original behavior for backward compatibility
-            return get_action_mask(
-                formula=formula,
-                used_element_counts=used_counts,
-                actions_list=self.actions_list,
-                atom_tokens=self.atom_tokens,
-                bonded_atom_tokens=self.bonded_atom_tokens,
-                current_selfies=self.current_selfies,
-                formula_masking=self.formula_masking,
-                end_token=self.end_token,
-                remove_token=self.remove_token,
-                special_tokens=self.tokenizer_special_tokens
-            )
+            mask[self.eos_token_id] = True  # Always allow EOS if no early termination prevention
+            
+        return mask
 
+    def _apply_formula_masking(self, mask, formula, used_counts):
+        """Apply formula-based masking to limit tokens based on molecular formula"""
+        try:
+            from zoo.masspecgym.envs.utils import parse_formula_counts, extract_element_from_token
+            
+            target_element_counts = parse_formula_counts(formula)
+            
+            # For each valid SELFIES token, check if it's allowed based on formula
+            for token_id in self.valid_selfies_token_ids:
+                if not mask[token_id]:  # Skip if already masked
+                    continue
+                    
+                token = self.token_id_to_token[token_id]
+                element = extract_element_from_token(token)
+                
+                if element:
+                    target_count = target_element_counts.get(element, 0)
+                    used_count = used_counts.get(element, 0)
+                    
+                    # If we've used all allowed atoms of this type, mask it out
+                    if target_count > 0 and used_count >= target_count:
+                        mask[token_id] = False
+                    # If element not in formula at all, mask it out
+                    elif target_count == 0:
+                        mask[token_id] = False
+                        
+        except Exception as e:
+            print(f"[WARN] Formula masking failed: {e}")
+            # Continue without formula masking
+            
+        return mask
 
+    def _should_allow_eos_token(self):
+        """Determine if EOS token should be allowed based on formula completion"""
+        try:
+            from zoo.masspecgym.envs.utils import calculate_formula_completion_reward
+            
+            if not hasattr(self, 'target_spectrum') or not self.target_spectrum.get('formulas'):
+                return True  # Allow EOS if no formula constraint
+                
+            formula = self.target_spectrum['formulas']
+            used_counts = getattr(self, 'used_element_counts', {})
+            
+            # Calculate completion ratio
+            completion_ratio = calculate_formula_completion_reward(formula, used_counts)
+            
+            # Allow EOS if completion is high enough or too many steps taken
+            total_used_atoms = sum(used_counts.values()) if used_counts else 0
+            
+            return (completion_ratio >= self.min_formula_completion or 
+                   total_used_atoms >= self.allow_early_end_after_steps)
+                   
+        except Exception as e:
+            print(f"[WARN] EOS token checking failed: {e}")
+            return True  # Default to allowing EOS if check fails
 
     def reset_with_info(self):
         """
@@ -1082,87 +1217,99 @@ class MassGymEnv(gym.Env):
         #     if action_mask[i]:
         #         print("debug: available action: ", self.actions_list[i])
 
-        # Execute the action
-        action_name = self.actions_list[action]
+        # Execute the action - action is directly a token ID
+        action_token_id = action
+        action_name = self.token_id_to_token.get(action_token_id, '<UNK>')
         raw_reward = 0.0
         info = {}
         done = False
         self._timestep += 1
+        
+        # Check if we've reached the predicted maximum episode length
+        current_max_steps = self.predicted_max_steps if hasattr(self, 'predicted_max_steps') and self.predicted_max_steps else self.max_episode_steps
+        
+        if self.episode_length >= current_max_steps:
+            print(f"[INFO] Reached predicted max steps ({current_max_steps}), forcing EOS termination")
+            done = True
+            # Force EOS action for reward computation
+            action_token_id = self.eos_token_id
+            action_name = self.token_id_to_token.get(action_token_id, '<EOS>')
+            
+        # Also check original max_episode_steps as absolute limit
         if self.episode_length >= self.max_episode_steps:
-            print("debug: episode length >= max_episode_steps")
+            print(f"[INFO] Reached absolute max episode steps ({self.max_episode_steps})")
             done = True
             
-        # Handle special tokens (should not be executed as actions)
-        if action_name in self.tokenizer_special_tokens:
-            # Special tokens are invalid actions during gameplay
-            raw_reward = -0.5
-            print(f"[WARN] Invalid special token action attempted: {action_name}")
-        elif action_name == self.remove_token:
-            if len(self.bond_counts) == 0:
-                raw_reward = -0.5  # Can't remove from empty molecule
-            else:
-                # Remove the last token and update atom tracking
-                if self.current_selfies:
-                    # Use utility function to remove last token
-                    updated_selfies, removed_token = remove_last_token_from_selfies(self.current_selfies)
-                    
-                    if removed_token:
-                        # Update atom counts using utility function
-                        self.used_element_counts = update_atom_counts(
-                            removed_token, self.used_element_counts, increment=False
-                        )
-                        
-                        self.current_selfies = updated_selfies
-                        
-                        # Update bond counts
-                        if self.bond_counts:
-                            self.bond_counts.pop()
-                        
-                        raw_reward = 0.0  # Neutral reward for successful removal
+        # Handle special tokens
+        if action_token_id == self.eos_token_id:
+            # EOS token indicates episode termination
+            done = True
+            self.should_done = True
+            # Use reward network for final reward computation
+            if self.use_reward_network and self.reward_function:
+                try:
+                    spectrum_embed = self.target_spectrum['embeds']
+                    formula = self.target_spectrum['formulas']
+                    similarity_score = self.reward_function(
+                        self.current_selfies, 
+                        spectrum_embed, 
+                        formula
+                    )
+                    if not self.reward_obtained:
+                        self.reward_obtained = True
+                        raw_reward = similarity_score  # Use similarity as reward
+                        info['forced_termination'] = self.episode_length >= current_max_steps
+                        info['predicted_max_steps'] = current_max_steps
+                        info['actual_steps'] = self.episode_length
                     else:
-                        raw_reward = -0.5
-                else:
-                    raw_reward = -0.5
-        else:
-            if action_name == self.end_token or self.episode_length >= self.max_episode_steps:
-                # if self.episode_length >= self.max_episode_steps:
-                    # print("debug: done by episode length >= max_episode_steps") 
-                # else:
-                    # print("debug: done by action_name == self.end_token")
-                    # print(f"debug: current selfies: {self.current_selfies},\ntarget selfies: {sf.encoder(self.smiles)}") 
-                done = True
-                self.should_done = True
-                # Use reward network for final reward computation
-                if self.use_reward_network and self.reward_function:
-                    try:
-                        spectrum_embed = self.target_spectrum['embeds']
-                        formula = self.target_spectrum['formulas']
-                        similarity_score = self.reward_function(
-                            self.current_selfies, 
-                            spectrum_embed, 
-                            formula
-                        )
-                        if not self.reward_obtained:
-                            self.reward_obtained = True
-                            raw_reward = similarity_score  # Use similarity as reward
-                        else:
-                            raw_reward = 0.0
-                    except Exception as e:
-                        print(f"[WARN] Error computing reward with network: {e}")
-                        # Fallback to exact match
-                        if self.current_selfies == sf.encoder(self.smiles):
-                            raw_reward = 1.0
-                        else:
-                            raw_reward = -1.0
-                else:
+                        raw_reward = 0.0
+                except Exception as e:
+                    print(f"[WARN] Error computing reward with network: {e}")
                     # Fallback to exact match
                     if self.current_selfies == sf.encoder(self.smiles):
                         raw_reward = 1.0
                     else:
                         raw_reward = -1.0
+            else:
+                # Fallback to exact match
+                if self.current_selfies == sf.encoder(self.smiles):
+                    raw_reward = 1.0
+                else:
+                    raw_reward = -1.0
+        elif action_token_id in [self.pad_token_id, self.sos_token_id, self.unk_token_id]:
+            # Other special tokens are invalid actions during gameplay
+            raw_reward = -0.5
+            print(f"[WARN] Invalid special token action attempted: {action_name} (ID: {action_token_id})")
+        else:
+            if done:
+                # Episode ended due to max steps - give penalty reward but still call reward network
+                if not self.reward_obtained:
+                    self.reward_obtained = True
+                    # Still compute reward even for forced termination
+                    if self.use_reward_network and self.reward_function:
+                        try:
+                            spectrum_embed = self.target_spectrum['embeds']
+                            formula = self.target_spectrum['formulas']
+                            similarity_score = self.reward_function(
+                                self.current_selfies, 
+                                spectrum_embed, 
+                                formula
+                            )
+                            # Apply penalty for not completing properly, but still use similarity
+                            raw_reward = similarity_score * 0.8  # 20% penalty for forced termination
+                            info['forced_termination'] = True
+                            info['predicted_max_steps'] = current_max_steps
+                            info['actual_steps'] = self.episode_length
+                        except Exception as e:
+                            print(f"[WARN] Error computing reward with network: {e}")
+                            raw_reward = -1.0  # Penalty for not completing properly
+                    else:
+                        raw_reward = -1.0  # Penalty for not completing properly
+                else:
+                    raw_reward = 0.0
 
-            # Handle atom addition
-            elif action_name in self.actions_list:
+            # Handle atom addition - check if it's a valid SELFIES token
+            elif action_token_id in self.valid_selfies_token_ids:
                 valid_selfies = validate_selfies_addition(self.current_selfies, action_name)
                 
                 if valid_selfies:
@@ -1226,7 +1373,7 @@ class MassGymEnv(gym.Env):
         combined_obs = torch.cat([spectrum, token, formula_token_ids], dim=-1)
 
         # Calculate expected observation dimension
-        expected_dim = 4096 + self.max_len + self.formula_max_len  # 4096 + 100 + 50 = 4246
+        expected_dim = 4096 + self.max_len + self.formula_max_len  # 4096 + 150 + 50 = 4296
 
         obs_dict = {
             'observation': combined_obs,
@@ -1244,6 +1391,10 @@ class MassGymEnv(gym.Env):
         info["raw_reward"] = raw_reward
         if self.current_selfies:
             info["current_selfies"] = self.current_selfies
+        
+        # Add dynamic episode information
+        info['predicted_max_steps'] = getattr(self, 'predicted_max_steps', self.max_episode_steps)
+        info['current_steps'] = self.episode_length
         
         # Add GAG-specific information at every step for faster data collection
         # This allows the GAG collector to extract pairs without waiting for episode completion

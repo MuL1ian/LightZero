@@ -19,8 +19,8 @@ from lzero.model.global_reward_network import get_reward_function, get_reward_ne
 
 # Import MassSelfiesED model components
 # try:
-from lzero.model.muzero_transformer import MassSelfiesED, SelfiesTokenizer
-from lzero.model.pretrain_transformer import load_pretrained_model, PretrainConfig
+# from lzero.model.muzero_transformer import MassSelfiesED, SelfiesTokenizer
+# from lzero.model.pretrain_transformer import load_pretrained_model, PretrainConfig
 MASSSELFIESED_AVAILABLE = True
 # except ImportError as e:
 #     print(f"[WARN] MassSelfiesED not available: {e}")

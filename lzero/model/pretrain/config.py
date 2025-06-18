@@ -25,7 +25,7 @@ class PretrainConfig:
     batch_size: int = 32
     learning_rate: float = 5e-5  
     num_epochs: int = 30
-    warmup_steps: int = 1500  
+    warmup_steps: int = 50  
     gradient_clip: float = 0.5  
     weight_decay: float = 0.05 
     
@@ -46,8 +46,8 @@ class PretrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Dataset parameters
-    train_data_file: str = "/hy-tmp/MCTS/MassEnv/DataLoader/train_spectrum_embeds_msg.pt"
-    val_data_file: str = "/hy-tmp/MCTS/MassEnv/DataLoader/val_spectrum_embeds_msg.pt"
+    train_data_file: str = "/home/zirui/MassEnv/DataLoader/train_spectrum_embeds_msg.pt"
+    val_data_file: str = "/home/zirui/MassEnv/DataLoader/val_spectrum_embeds_msg.pt"
 
 
 @dataclass
@@ -58,5 +58,5 @@ class EvaluationConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     k_predictions: int = 1
     temperature: float = 0.0
-    test_data_file: str = "/hy-tmp/MCTS/MassEnv/DataLoader/test_spectrum_embeds_msg.pt"
+    test_data_file: str = "/home/zirui/MassEnv/DataLoader/test_spectrum_embeds_msg.pt"
     results_dir: str = "./evaluation_results" 

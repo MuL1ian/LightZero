@@ -15,7 +15,6 @@ import argparse
 import time
 
 from lzero.model.muzero_transformer import MassSelfiesED, SelfiesTokenizer
-from lzero.model.muzero_transformer import get_actions_list
 from config import PretrainConfig
 
 
@@ -780,10 +779,12 @@ def evaluate_on_test_set(model: MassSelfiesED, config: PretrainConfig, test_data
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pretrain SELFIES Transformer")
-    parser.add_argument("--load_checkpoint", type=str, help="Path to checkpoint to load", default="/hy-tmp/MCTS/MassEnv/main/LightZero/lzero/model/pretrain/pretrained_selfies_transformer/best_model.pt")
+    parser.add_argument("--load_checkpoint", type=str, help="Path to checkpoint to load", 
+                        # default="/hy-tmp/MCTS/MassEnv/main/LightZero/lzero/model/pretrain/pretrained_selfies_transformer/best_model.pt"
+                        )
     parser.add_argument("--eval_on_test", action="store_true", help="Evaluate on test set")
     parser.add_argument("--test_generation", action="store_true", help="Test generation capabilities")
-    parser.add_argument("--test_data_path", type=str, default="/hy-tmp/MCTS/MassEnv/DataLoader/test_spectrum_embeds_msg.pt", 
+    parser.add_argument("--test_data_path", type=str, default="/home/zirui/MassEnv/DataLoader/test_spectrum_embeds_msg.pt", 
                         help="Path to test data file")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for evaluation (default: 32)")
     
@@ -807,13 +808,13 @@ if __name__ == "__main__":
     else:
         # Normal pretraining
         config = PretrainConfig(
-            batch_size=32,
+            batch_size=1024,
             learning_rate=5e-5,
             num_epochs=30,
             max_len=120,
             d_model=512,
             n_spectrum_heads=32,
-            save_dir="./pretrained_selfies_transformer"
+            save_dir="./pretrained_selfies_transformer_enhanced"
         )
         
         # start pretrain

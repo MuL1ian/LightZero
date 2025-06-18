@@ -174,11 +174,11 @@ def get_action_mask(
     bonded_atom_tokens: List[str],
     current_selfies: str = "",
     formula_masking: bool = True,
-    end_token: str = "<END>",
-    remove_token: str = "<REMOVE>",
+    end_token: str = "</s>",  # Default to EOS token instead of <END>
+    remove_token: str = None,  # Default to None since remove is no longer available
     special_tokens: List[str] = None,
-    min_formula_completion: float = 0.8,  # Minimum completion ratio before END is allowed
-    allow_early_end_after_steps: int = 20  # Allow END after this many steps even if incomplete
+    min_formula_completion: float = 0.8,  # Minimum completion ratio before EOS is allowed
+    allow_early_end_after_steps: int = 20  # Allow EOS after this many steps even if incomplete
 ) -> np.ndarray:
     """
     Generate a boolean mask over the action space indicating which actions are valid.
@@ -191,11 +191,11 @@ def get_action_mask(
         bonded_atom_tokens (List[str]): List of bonded atom tokens
         current_selfies (str): Current SELFIES string
         formula_masking (bool): Whether to apply formula-based masking
-        end_token (str): End token identifier
-        remove_token (str): Remove token identifier
+        end_token (str): End token identifier (default: "</s>" for EOS token)
+        remove_token (str): Remove token identifier (default: None, no longer supported)
         special_tokens (List[str]): List of special tokens to mask out
-        min_formula_completion (float): Minimum completion ratio before END token is allowed
-        allow_early_end_after_steps (int): Allow END token after this many steps even if incomplete
+        min_formula_completion (float): Minimum completion ratio before EOS token is allowed
+        allow_early_end_after_steps (int): Allow EOS token after this many steps even if incomplete
         
     Returns:
         np.ndarray: Boolean mask array
@@ -259,8 +259,8 @@ def get_action_mask(
         else:
             mask[idx] = False  # Mask out END token to prevent early termination
     
-    # Remove token not allowed if no current molecule
-    if not current_selfies and remove_token in actions_list:
+    # Remove token not allowed if no current molecule (only if remove_token exists)
+    if remove_token and not current_selfies and remove_token in actions_list:
         idx = actions_list.index(remove_token)
         mask[idx] = False
     
@@ -502,8 +502,8 @@ def get_action_mask_from_selfies_string(
     atom_tokens: List[str],
     bonded_atom_tokens: List[str],
     formula_masking: bool = True,
-    end_token: str = "<END>",
-    remove_token: str = "<REMOVE>",
+    end_token: str = "</s>",  # Default to EOS token instead of <END>
+    remove_token: str = None,  # Default to None since remove is no longer available
     special_tokens: List[str] = None,
     min_formula_completion: float = 0.8,  # Minimum completion ratio before END is allowed
     allow_early_end_after_steps: int = 20  # Allow END after this many steps even if incomplete
@@ -520,17 +520,17 @@ def get_action_mask_from_selfies_string(
         atom_tokens (List[str]): List of pure atom tokens
         bonded_atom_tokens (List[str]): List of bonded atom tokens
         formula_masking (bool): Whether to apply formula-based masking
-        end_token (str): End token identifier
-        remove_token (str): Remove token identifier
+        end_token (str): End token identifier (default: "</s>" for EOS token)
+        remove_token (str): Remove token identifier (default: None, no longer supported)
         special_tokens (List[str]): List of special tokens to mask out
-        min_formula_completion (float): Minimum completion ratio before END token is allowed
-        allow_early_end_after_steps (int): Allow END token after this many steps even if incomplete
+        min_formula_completion (float): Minimum completion ratio before EOS token is allowed
+        allow_early_end_after_steps (int): Allow EOS token after this many steps even if incomplete
         
     Returns:
         np.ndarray: Boolean mask array
         
     Examples:
-        >>> actions = ['[C]', '[H]', '[O]', '<END>']
+        >>> actions = ['[C]', '[H]', '[O]', '</s>']
         >>> atom_tokens = ['[C]', '[H]', '[O]']
         >>> mask = get_action_mask_from_selfies_string(
         ...     formula="CH4",
@@ -562,16 +562,16 @@ def get_action_mask_from_selfies_string(
 
 
 def test_intelligent_end_masking():
-    """Test the intelligent END token masking functionality."""
-    print("Testing intelligent END token masking...")
+    """Test the intelligent EOS token masking functionality."""
+    print("Testing intelligent EOS token masking...")
     
     # Test setup
-    actions = ['[C]', '[H]', '[O]', '[N]', '<END>']
+    actions = ['[C]', '[H]', '[O]', '[N]', '</s>']  # Use EOS token instead of <END>
     atom_tokens = ['[C]', '[H]', '[O]', '[N]']
     bonded_tokens = []
     
-    # Test case 1: Low completion should mask END token
-    print("\n1. Testing low completion ratio (should mask END token)")
+    # Test case 1: Low completion should mask EOS token
+    print("\n1. Testing low completion ratio (should mask EOS token)")
     used_counts = {'C': 1, 'H': 1}  # Only used 2 out of 8 total atoms in CH4O2
     mask = get_action_mask(
         formula="C2H4O2",  # Acetic acid - 8 total atoms
@@ -580,15 +580,17 @@ def test_intelligent_end_masking():
         atom_tokens=atom_tokens,
         bonded_atom_tokens=bonded_tokens,
         formula_masking=True,
+        end_token='</s>',  # Use EOS token
+        remove_token=None,  # No remove token
         min_formula_completion=0.8,
         allow_early_end_after_steps=20
     )
-    end_idx = actions.index('<END>')
-    print(f"Formula: C2H4O2, Used: {used_counts}, END masked: {not mask[end_idx]}")
-    assert not mask[end_idx], "END token should be masked with low completion"
+    eos_idx = actions.index('</s>')
+    print(f"Formula: C2H4O2, Used: {used_counts}, EOS masked: {not mask[eos_idx]}")
+    assert not mask[eos_idx], "EOS token should be masked with low completion"
     
-    # Test case 2: High completion should allow END token
-    print("\n2. Testing high completion ratio (should allow END token)")
+    # Test case 2: High completion should allow EOS token
+    print("\n2. Testing high completion ratio (should allow EOS token)")
     used_counts = {'C': 2, 'H': 4, 'O': 1}  # Used 7 out of 8 atoms
     mask = get_action_mask(
         formula="C2H4O2",
@@ -597,14 +599,16 @@ def test_intelligent_end_masking():
         atom_tokens=atom_tokens,
         bonded_atom_tokens=bonded_tokens,
         formula_masking=True,
+        end_token='</s>',  # Use EOS token
+        remove_token=None,  # No remove token
         min_formula_completion=0.8,
         allow_early_end_after_steps=20
     )
-    print(f"Formula: C2H4O2, Used: {used_counts}, END allowed: {mask[end_idx]}")
-    assert mask[end_idx], "END token should be allowed with high completion"
+    print(f"Formula: C2H4O2, Used: {used_counts}, EOS allowed: {mask[eos_idx]}")
+    assert mask[eos_idx], "EOS token should be allowed with high completion"
     
-    # Test case 3: Many steps should allow END token even with low completion
-    print("\n3. Testing many steps override (should allow END token)")
+    # Test case 3: Many steps should allow EOS token even with low completion
+    print("\n3. Testing many steps override (should allow EOS token)")
     used_counts = {'C': 25}  # More than 20 atoms used
     mask = get_action_mask(
         formula="CH4",
@@ -613,14 +617,16 @@ def test_intelligent_end_masking():
         atom_tokens=atom_tokens,
         bonded_atom_tokens=bonded_tokens,
         formula_masking=True,
+        end_token='</s>',  # Use EOS token
+        remove_token=None,  # No remove token
         min_formula_completion=0.8,
         allow_early_end_after_steps=20
     )
-    print(f"Formula: CH4, Used: {used_counts}, END allowed (many steps): {mask[end_idx]}")
-    assert mask[end_idx], "END token should be allowed after many steps"
+    print(f"Formula: CH4, Used: {used_counts}, EOS allowed (many steps): {mask[eos_idx]}")
+    assert mask[eos_idx], "EOS token should be allowed after many steps"
     
-    # Test case 4: Disabled formula masking should always allow END
-    print("\n4. Testing disabled formula masking (should allow END token)")
+    # Test case 4: Disabled formula masking should always allow EOS
+    print("\n4. Testing disabled formula masking (should allow EOS token)")
     used_counts = {'C': 1}  # Low completion
     mask = get_action_mask(
         formula="C6H12O6",
@@ -629,13 +635,15 @@ def test_intelligent_end_masking():
         atom_tokens=atom_tokens,
         bonded_atom_tokens=bonded_tokens,
         formula_masking=False,  # Disabled
+        end_token='</s>',  # Use EOS token
+        remove_token=None,  # No remove token
         min_formula_completion=0.8,
         allow_early_end_after_steps=20
     )
-    print(f"Formula masking disabled, Used: {used_counts}, END allowed: {mask[end_idx]}")
-    assert mask[end_idx], "END token should be allowed when formula masking is disabled"
+    print(f"Formula masking disabled, Used: {used_counts}, EOS allowed: {mask[eos_idx]}")
+    assert mask[eos_idx], "EOS token should be allowed when formula masking is disabled"
     
-    print("\n✅ All intelligent END token masking tests passed!")
+    print("\n✅ All intelligent EOS token masking tests passed!")
 
 
 # Update the main test function to include the new test
@@ -656,7 +664,7 @@ def test_utils():
     
     # Test action masking - use a different formula that doesn't include hydrogen
     # since hydrogen is filtered out by the environment
-    actions = ['[C]', '[O]', '[N]', '[S]', '<END>']
+    actions = ['[C]', '[O]', '[N]', '[S]', '</s>']  # Use EOS token instead of <END>
     atom_tokens = ['[C]', '[O]', '[N]', '[S]']  # No hydrogen since it's filtered
     bonded_tokens = []
     used_counts = {'C': 1, 'O': 1}  # Used 2 out of 3 atoms in CO2
@@ -667,13 +675,15 @@ def test_utils():
         actions_list=actions,
         atom_tokens=atom_tokens,
         bonded_atom_tokens=bonded_tokens,
+        end_token='</s>',  # Use EOS token
+        remove_token=None,  # No remove token
         min_formula_completion=0.5  # Lower completion threshold for this test
     )
     
     # Carbon should be masked (used 1 out of 1), Oxygen should be available (used 1 out of 2)
     # Nitrogen and Sulfur should be masked (not in formula)
-    # END should be available since completion ratio is 2/3 = 0.67 > 0.5
-    expected_mask = [False, True, False, False, True]  # [C, O, N, S, END]
+    # EOS should be available since completion ratio is 2/3 = 0.67 > 0.5
+    expected_mask = [False, True, False, False, True]  # [C, O, N, S, EOS]
     assert np.array_equal(mask, expected_mask), f"Expected {expected_mask}, got {mask.tolist()}"
     print("✅ Action masking tests passed")
     

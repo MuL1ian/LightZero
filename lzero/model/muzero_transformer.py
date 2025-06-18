@@ -7,6 +7,7 @@ from lzero.model.common import MZNetworkOutput
 from lzero.model.selfies_tokenizer import SelfiesTokenizer, pad_to_maxlen
 from zoo.masspecgym.envs.massgymenv import MassGymEnv
 import re
+import numpy as np
 
 # Import global reward network
 try:
@@ -16,42 +17,7 @@ except ImportError as e:
     print(f"[WARN] Global reward network not available in transformer: {e}")
     GLOBAL_REWARD_AVAILABLE = False
     global_reward_network = None
-# -----------------------------------------------------------------------------
-# Env for get the action list 
-# -----------------------------------------------------------------------------
-def get_actions_list():
-    """Get the actions list from the environment"""
-    try:
-        # cfg not used, just for init 
-        cfg = {
-            'env_id': "mass_spec_env",
-            'render_mode': None,
-            'obs_type': 'fingerprint',
-            'reward_normalize': False,
-            'reward_norm_scale': 1.0,
-            'reward_type': 'cosine_similarity',
-            'target_spectrum': {
-                'embeds': torch.tensor([]), 
-                'formulas': ''  
-            },
-            'max_episode_steps': 100,
-            'is_collect': True,
-            'ignore_legal_actions': False,
-            'need_flatten': False,
-            'max_len': 100,
-            'formula_masking': True,
-        }
-
-        env = MassGymEnv(cfg)
-        return env.actions_list  # length 71
-    except:
-        # Fallback actions list for testing (excluding [H] since hydrogens are implicit in SELFIES)
-        return ['[C]', '[O]', '[N]', '[S]', '[P]', '[F]', '[Cl]', '[Br]', '[I]', 
-                '[=C]', '[=N]', '[=O]', '[=S]', '[#C]', '[#N]', '[Ring1]', '[Ring2]', '[Ring3]',
-                '[Branch1]', '[Branch2]', '[Branch3]', '<END>', '<REMOVE>'] + ['[UNK]'] * 47
-
-# Get actions list (lazy loading)
-actions_list = None
+# Remove actions_list complexity - now using tokenizer vocabulary directly
 
 # Custom Chemical Formula Tokenizer
 class ChemicalFormulaTokenizer:
@@ -244,11 +210,8 @@ class MassSelfiesED(nn.Module):
         self.spectrum_dim = 4096
         # tokenizer for special ids and pad
         self.tokenizer = SelfiesTokenizer(max_len=max_len)
-        # compute action_token_ids from global actions_list
-        global actions_list
-        if actions_list is None:
-            actions_list = get_actions_list()
-        self.action_token_ids = [self.tokenizer.token_to_id(tok) for tok in actions_list]
+        # Simplified: vocab_size = action_space_size, action_index = token_id
+        self.vocab_size = len(self.tokenizer.get_vocab())
 
         # record special token ids
         self.pad_token_id = self.tokenizer.pad_token_id
@@ -288,7 +251,7 @@ class MassSelfiesED(nn.Module):
                                                dropout=dropout, batch_first=True)
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_dec)
 
-        # Heads
+        # Heads - output full vocabulary size since action_index = token_id
         self.action_head = nn.Linear(d_model, vocab_size, bias=False)
         self.value_head  = nn.Sequential(nn.Linear(d_model, d_model), nn.Tanh(), nn.Linear(d_model, 1))
         self.to(self.device)
@@ -392,14 +355,14 @@ class MassSelfiesED(nn.Module):
         full_logits = self.action_head(last)  # (B, vocab_size)
         value       = self.value_head(last).squeeze(-1)
 
-        # mask special tokens
-        for sid in [self.pad_token_id, self.sos_token_id,
-                    self.eos_token_id, self.unk_token_id]:
-            full_logits[:, sid] = float('-1e9')
+        # Apply basic masking: mask out special tokens except EOS (which can be used for termination)
+        full_logits[:, self.pad_token_id] = float('-1e9')
+        full_logits[:, self.sos_token_id] = float('-1e9') 
+        full_logits[:, self.unk_token_id] = float('-1e9')
+        # Note: EOS token is kept unmasked as it's used for episode termination
 
-        # slice to environment action space (71)
-        policy_logits = full_logits[:, self.action_token_ids]  # (B,71)
-        return policy_logits, value
+        # Return full vocabulary logits - action_index = token_id
+        return full_logits, value
 
 # -----------------------------------------------------------------------------
 # Greedy step prediction helper
@@ -427,19 +390,9 @@ def step_prediction(model: MassSelfiesED,
     # forward - returns full vocabulary logits where index = token_id
     full_logits, value = model(vec, ids, mask)  # (B, vocab_size)
     
-    # Mask out non-action tokens, keeping only valid action tokens
-    global actions_list
-    if actions_list is None:
-        actions_list = get_actions_list()
-    
-    # Create action mask - only allow valid action tokens
-    action_mask = torch.full_like(full_logits[0], float('-1e9'), device=dev)
-    for action_token in actions_list:
-        token_id = tokenizer.token_to_id(action_token)
-        action_mask[token_id] = 0  # Allow this token
-    
-    # Apply action mask
-    masked_logits = full_logits + action_mask.unsqueeze(0)
+    # The model already applies basic masking (pad, sos, unk tokens)
+    # Additional environment-specific masking will be handled by the environment
+    masked_logits = full_logits
     
     # Get the token ID with highest probability
     next_token_id = torch.argmax(masked_logits, dim=-1)[0].item()
@@ -536,10 +489,10 @@ class MuZeroSelfiesTransformer(nn.Module):
         """Perform recurrent inference step"""
         next_latent_state, reward = self._dynamics(latent_state, action)
         # action is a tensor containing token IDs directly
-        # check if any of the actions is the end token
-        end_token_id = self.tok.token_to_id("<END>") if hasattr(self.tok, 'token_to_id') else self.tok.end_token_id
-        if (action == end_token_id).any():
-            print("end token found in recurrent inference")
+        # check if any of the actions is the EOS token
+        eos_token_id = self.tok.eos_token_id
+        if (action == eos_token_id).any():
+            print("EOS token found in recurrent inference")
 
         # For base class, extract only spectrum and SELFIES parts for transformer
         spectrum = next_latent_state[:, :self.spectrum_dim]
@@ -549,24 +502,10 @@ class MuZeroSelfiesTransformer(nn.Module):
         vocab_size = len(self.tok.get_vocab())
         selfies_part_clamped = torch.clamp(selfies_part.long(), 0, vocab_size - 1)
         
-        mask = (selfies_part_clamped != self.tok.pad_token_id) & (selfies_part_clamped != self.tok.end_token_id)
+        mask = (selfies_part_clamped != self.tok.pad_token_id) & (selfies_part_clamped != self.tok.eos_token_id)
 
-        # Get full vocabulary logits
-        full_logits, value = self.transformer(spectrum, selfies_part_clamped, mask)
-        
-        # Apply action masking - mask out non-action tokens
-        global actions_list
-        if actions_list is None:
-            actions_list = get_actions_list()
-        
-        # Create action mask
-        action_mask = torch.full_like(full_logits, float('-1e9'), device=self.device)
-        for action_token in actions_list:
-            token_id = self.tok.token_to_id(action_token)
-            action_mask[:, token_id] = 0  # Allow this token
-        
-        # Apply mask
-        policy_logits = full_logits + action_mask
+        # Get full vocabulary logits - action_index = token_id
+        policy_logits, value = self.transformer(spectrum, selfies_part_clamped, mask)
         value = value.unsqueeze(-1)
 
         return MZNetworkOutput(value=value, reward=reward, policy_logits=policy_logits, latent_state=next_latent_state)
@@ -595,24 +534,82 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                  prevent_early_termination=True,
                  min_formula_completion=0.8,
                  allow_early_end_after_steps=20,
+                 # Dynamic episode length prediction parameters
+                 use_dynamic_max_steps=True,
+                 dynamic_safety_margin=1.1,
                  **kwargs):
-        super().__init__(observation_shape, max_len, d_model, n_enc, n_dec, 
-                        n_head, dropout, device, **kwargs)
+        """
+        Enhanced MuZero Selfies Transformer with formula extraction and intelligent masking.
         
-        # Load pretrained transformer weights if path is provided
-        if pretrained_transformer_path is not None:
+        Args:
+            observation_shape: Total observation dimension (4096 spectrum + max_len SELFIES + formula_max_len formula = 4296)
+            max_len: Maximum SELFIES token length (updated to 150)
+            d_model: Transformer hidden dimension
+            n_enc: Number of encoder layers
+            n_dec: Number of decoder layers  
+            n_head: Number of attention heads
+            dropout: Dropout rate
+            device: Device to run on
+            target_formula: Deprecated - formula is now extracted from observations
+            formula_max_len: Maximum length for chemical formula tokens
+            pretrained_transformer_path: Path to pretrained transformer weights
+            prevent_early_termination: Whether to apply intelligent END token masking
+            min_formula_completion: Minimum completion ratio before END is allowed
+            allow_early_end_after_steps: Allow END after this many steps even if incomplete
+            use_dynamic_max_steps: Whether to use dynamic episode length prediction
+            dynamic_safety_margin: Safety margin for dynamic episode length prediction
+        """
+        # Initialize parent class
+        super().__init__(
+            observation_shape=observation_shape,
+            max_len=max_len,
+            d_model=d_model,
+            n_enc=n_enc,
+            n_dec=n_dec,
+            n_head=n_head,
+            dropout=dropout,
+            device=device,
+            **kwargs
+        )
+        
+        # Enhanced configuration
+        self.observation_shape = observation_shape
+        self.spectrum_dim = 4096
+        self.formula_max_len = formula_max_len
+        
+        # Intelligent END token masking configuration
+        self.prevent_early_termination = prevent_early_termination
+        self.min_formula_completion = min_formula_completion
+        self.allow_early_end_after_steps = allow_early_end_after_steps
+        
+        # Dynamic episode length prediction configuration
+        self.use_dynamic_max_steps = use_dynamic_max_steps
+        self.dynamic_safety_margin = dynamic_safety_margin
+        self.predicted_max_steps_cache = {}  # Cache predictions by formula
+        
+        # Initialize enhanced tokenizer with vocab size 142
+        self.tokenizer = SelfiesTokenizer(max_len=max_len)
+        self.vocab_size = len(self.tokenizer.get_vocab())
+        self.eos_token_id = self.tokenizer.eos_token_id
+        
+        print(f"[INFO] Enhanced MuZero SELFIES Transformer initialized:")
+        print(f"  - Observation shape: {observation_shape}")
+        print(f"  - SELFIES max_len: {max_len}")  
+        print(f"  - Formula max_len: {formula_max_len}")
+        print(f"  - Vocab size: {self.vocab_size}")
+        print(f"  - Intelligent END masking: {prevent_early_termination}")
+        print(f"  - Dynamic max steps: {use_dynamic_max_steps}")
+        
+        # Load pretrained transformer if specified
+        if pretrained_transformer_path:
             self._load_pretrained_transformer(pretrained_transformer_path)
         
         # Note: target_formula is now extracted dynamically from observations
         
         # Update dimensions for new observation structure
         # Observation: spectrum (4096) + selfies tokens (max_len) + formula tokens (formula_max_len)
-        self.formula_max_len = formula_max_len
         self.selfies_start_idx = self.spectrum_dim  # 4096
         self.formula_start_idx = self.spectrum_dim + max_len  # 4096 + max_len
-        # print("debug: max_len: ", max_len)
-        # print("debug: formula_max_len: ", formula_max_len)
-        # print("debug: observation_shape: ", observation_shape)
         assert self.formula_start_idx + self.formula_max_len == observation_shape, \
             f"formula_start_idx + formula_max_len != observation_shape, {self.formula_start_idx} + {self.formula_max_len} != {observation_shape}"
         
@@ -638,24 +635,176 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                 print(f"[WARN] Could not import action masking utilities: {e}")
                 # Fallback: disable formula masking
                 self.get_action_mask_from_selfies_string = None
+    
+    def get_predicted_max_steps(self, formula: str) -> int:
+        """
+        Get predicted max steps for a given formula, with caching.
         
-        # Get action lists from environment for masking
-        global actions_list
-        if actions_list is None:
-            actions_list = get_actions_list()
-        self.atom_tokens = [token for token in actions_list if token.startswith('[') and 
-                           not any(special in token for special in ['Ring', 'Branch'])]
-        self.bonded_atom_tokens = []  # Can be extended if needed
+        Args:
+            formula (str): Chemical formula
+            
+        Returns:
+            int: Predicted maximum steps
+        """
+        if formula in self.predicted_max_steps_cache:
+            return self.predicted_max_steps_cache[formula]
         
-        # Store configuration
-        self.formula_max_len = formula_max_len
-        self.pretrained_transformer_path = pretrained_transformer_path
+        if self.use_dynamic_max_steps and formula:
+            prediction = predict_episode_length_from_formula_transformer(formula, self.dynamic_safety_margin)
+            predicted_steps = prediction['predicted_max_steps']
+            self.predicted_max_steps_cache[formula] = predicted_steps
+            return predicted_steps
+        else:
+            # Default fallback
+            default_steps = 100
+            self.predicted_max_steps_cache[formula] = default_steps
+            return default_steps
+    
+    def _dynamics(self, latent_state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Enhanced dynamics function with dynamic episode length checking and forced EOS termination.
         
-        # Intelligent END token masking configuration
-        self.prevent_early_termination = prevent_early_termination
-        self.min_formula_completion = min_formula_completion
-        self.allow_early_end_after_steps = allow_early_end_after_steps
+        Args:
+            latent_state: Current latent state
+            action: Action taken
+            
+        Returns:
+            Tuple of (next_state, reward)
+        """
+        batch_size = latent_state.shape[0]
+        device = latent_state.device
         
+        # Extract current SELFIES and formula from latent state
+        current_selfies_list = self._extract_selfies_from_latent_state(latent_state)
+        formula_list = self._extract_formula_from_latent_state(latent_state)
+        
+        # Check if we should force EOS termination based on predicted max steps
+        forced_eos_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        for i, (selfies, formula) in enumerate(zip(current_selfies_list, formula_list)):
+            # Use proper tokenization method
+            if hasattr(self.tokenizer, 'tokenize_selfies'):
+                current_length = len(self.tokenizer.tokenize_selfies(selfies)) if selfies else 0
+            else:
+                # Fallback: estimate length from string length
+                current_length = len(selfies) // 3 if selfies else 0  # Rough estimate
+            predicted_max = self.get_predicted_max_steps(formula)
+            
+            if current_length >= predicted_max:
+                forced_eos_mask[i] = True
+                print(f"[INFO] Forcing EOS for batch {i}: length {current_length} >= predicted max {predicted_max}")
+        
+        # Force EOS action for sequences that have reached predicted limit
+        modified_action = action.clone()
+        modified_action[forced_eos_mask] = self.eos_token_id
+        
+        # Update latent state by appending the action token
+        # latent_state shape: [batch_size, max_len] (current SELFIES tokens)
+        # action shape: [batch_size]
+        
+        # Shift existing tokens left and append new action
+        next_latent_state = latent_state.clone()
+        
+        # For each batch item, append the action if there's space
+        for i in range(batch_size):
+            current_tokens = next_latent_state[i]
+            action_token = modified_action[i].item()
+            
+            # Find the first padding token position
+            pad_positions = (current_tokens == self.tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
+            if len(pad_positions) > 0:
+                # There's space, insert the action token
+                insert_pos = pad_positions[0].item()
+                next_latent_state[i, insert_pos] = action_token
+            else:
+                # No space, shift left and append at the end
+                next_latent_state[i, :-1] = current_tokens[1:]
+                next_latent_state[i, -1] = action_token
+        
+        # Compute reward
+        reward = self._compute_reward(next_latent_state, modified_action, forced_eos_mask)
+        
+        return next_latent_state, reward
+
+    def _compute_reward(self, latent_state: torch.Tensor, action: torch.Tensor, forced_eos_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute reward for the current state, ensuring global reward server is called for EOS actions.
+        
+        Args:
+            latent_state: Current latent state
+            action: Action taken
+            forced_eos_mask: Mask indicating which sequences were forced to terminate
+            
+        Returns:
+            Tensor: Computed rewards
+        """
+        batch_size = latent_state.shape[0]
+        device = latent_state.device
+        rewards = torch.zeros(batch_size, device=device)
+        
+        # Check for EOS actions (both natural and forced)
+        eos_mask = (action == self.eos_token_id)
+        
+        if eos_mask.any():
+            # Extract SELFIES and spectrum information for reward computation
+            current_selfies_list = self._extract_selfies_from_latent_state(latent_state)
+            formula_list = self._extract_formula_from_latent_state(latent_state)
+            
+            # Get spectrum embeddings from latent state (assuming they're stored somehow)
+            # This would need to be implemented based on how spectrum info is stored in latent state
+            spectrum_embeds = self._extract_spectrum_from_latent_state(latent_state)
+            
+            # Try to get global reward function
+            try:
+                from lzero.model import global_reward_network
+                reward_function = global_reward_network.get_reward_function()
+                
+                for i in range(batch_size):
+                    if eos_mask[i]:
+                        selfies = current_selfies_list[i]
+                        formula = formula_list[i]
+                        spectrum_embed = spectrum_embeds[i] if spectrum_embeds is not None else torch.zeros(4096, device=device)
+                        
+                        try:
+                            # Call global reward network
+                            similarity_score = reward_function(selfies, spectrum_embed, formula)
+                            
+                            # Apply penalty for forced termination
+                            if forced_eos_mask[i]:
+                                similarity_score *= 0.8  # 20% penalty for forced termination
+                                print(f"[INFO] Applied forced termination penalty: {similarity_score}")
+                            
+                            rewards[i] = similarity_score
+                            
+                        except Exception as e:
+                            print(f"[WARN] Error computing reward with global network: {e}")
+                            # Fallback reward
+                            rewards[i] = -1.0 if forced_eos_mask[i] else 0.0
+                            
+            except ImportError:
+                print("[WARN] Global reward network not available, using fallback rewards")
+                # Fallback: penalty for forced termination, neutral for natural EOS
+                for i in range(batch_size):
+                    if eos_mask[i]:
+                        rewards[i] = -1.0 if forced_eos_mask[i] else 0.0
+        
+        return rewards
+    
+    def _extract_spectrum_from_latent_state(self, latent_state: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Extract spectrum embeddings from latent state.
+        
+        Args:
+            latent_state: Current latent state
+            
+        Returns:
+            Tensor: Spectrum embeddings or None if not available
+        """
+        # This is a placeholder - the actual implementation would depend on
+        # how spectrum information is stored in the latent state
+        # For now, return None and let the reward computation handle it
+        return None
+
     def _load_pretrained_transformer(self, pretrained_path: str):
         """
         Load pretrained weights into the self.transformer (MassSelfiesED) component.
@@ -678,7 +827,7 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                     # If the import fails, create a minimal compatibility module
                     import types
                     compat_module = types.ModuleType('pretrain_transformer')
-                    from lzero.model.pretrain_transformer import PretrainConfig
+                    from lzero.model.pretrain.config import PretrainConfig
                     compat_module.PretrainConfig = PretrainConfig
                     sys.modules['pretrain_transformer'] = compat_module
             
@@ -765,33 +914,6 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         """Deprecated: target formula is now extracted dynamically from observations"""
         print(f"[WARN] set_target_formula is deprecated. Formula is now extracted from observations automatically.")
         
-    def _dynamics(self, latent_state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Update latent state by replacing last padding token with action in SELFIES part only"""
-        action = action.squeeze().float()
-
-        # Ensure latent_state has batch dimension
-        if latent_state.dim() == 1:
-            latent_state = latent_state.unsqueeze(0)
-        
-        # Clone for gradient computation
-        next_latent_state = latent_state.clone()
-
-        # Extract SELFIES part only for modification
-        selfies_part = next_latent_state[:, self.selfies_start_idx:self.formula_start_idx]
-        
-        # Find padding tokens only in SELFIES part
-        padding_mask = selfies_part == self.tok.pad_token_id
-        last_padding_token_index = torch.sum(padding_mask, dim=1) - 1
-        
-        # Update only the SELFIES part
-        batch_indices = torch.arange(next_latent_state.size(0))
-        global_indices = self.selfies_start_idx + last_padding_token_index
-        next_latent_state[batch_indices, global_indices] = action
-
-        reward = torch.zeros(latent_state.size(0), 1, device=latent_state.device)
-
-        return next_latent_state, reward
-
     def _extract_selfies_from_latent_state(self, latent_state: torch.Tensor) -> List[str]:
         """Extract SELFIES strings from latent state tensor"""
         # Ensure latent_state has batch dimension
@@ -805,12 +927,12 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         for batch_idx in range(selfies_ids.size(0)):
             # Get non-padding tokens
             token_ids = selfies_ids[batch_idx]
-            valid_mask = (token_ids != self.tok.pad_token_id) & (token_ids != self.tok.sos_token_id)
+            valid_mask = (token_ids != self.tokenizer.pad_token_id) & (token_ids != self.tokenizer.sos_token_id)
             valid_ids = token_ids[valid_mask].tolist()
             
             # Convert token IDs back to SELFIES string
             try:
-                selfies_str = self.tok.decode_to_selfies(valid_ids, skip_special_tokens=True)
+                selfies_str = self.tokenizer.decode_to_selfies(valid_ids, skip_special_tokens=True)
                 selfies_strings.append(selfies_str)
             except:
                 selfies_strings.append("")
@@ -824,23 +946,16 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
             latent_state = latent_state.unsqueeze(0)
             
         # Extract formula token IDs
-        # print(f"debug: spectrum_dim: {self.spectrum_dim}, max_len: {self.max_len}, formula_max_len: {self.formula_max_len}")
-        # print('debug: formula_start_idx: ', self.formula_start_idx)
-        # print("debug: latent_state shape: ", latent_state.shape)
         formula_ids = latent_state[:, self.formula_start_idx:].long()
-        # print("debug: formula_ids shape: ", formula_ids.shape)
         
         # Import BERT tokenizer for decoding
         formula_strings = []
         for batch_idx in range(formula_ids.size(0)):
             token_ids = formula_ids[batch_idx].tolist()
             # Decode formula tokens
-            # try:
             formula_str = self.formula_tokenizer.decode(token_ids, skip_special_tokens=True)
             
             formula_strings.append(formula_str.strip())
-            # except:
-            #     formula_strings.append("")
                 
         return formula_strings
     
@@ -859,52 +974,14 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         # Create base action mask - allow only valid action tokens
         action_mask = torch.full_like(full_logits, float('-1e9'), device=full_logits.device)
         for action_token in actions_list:
-            token_id = self.tok.token_to_id(action_token)
+            token_id = self.tokenizer.token_to_id(action_token)
             action_mask[:, token_id] = 0  # Allow this token
         
         # Apply base action mask
         masked_logits = full_logits + action_mask
         
-        # Apply formula-based masking if available
-        if not formula_list or not any(formula_list):
-            return masked_logits
-            
-        batch_size = full_logits.size(0)
-        
-        for batch_idx in range(batch_size):
-            current_selfies = current_selfies_list[batch_idx]
-            target_formula = formula_list[batch_idx] if batch_idx < len(formula_list) else ""
-            
-            if not target_formula:
-                continue
-                
-            try:
-                # Get action mask using the utility function
-                formula_action_mask = self.get_action_mask_from_selfies_string(
-                    formula=target_formula,
-                    current_selfies=current_selfies,
-                    actions_list=actions_list,
-                    atom_tokens=self.atom_tokens,
-                    bonded_atom_tokens=self.bonded_atom_tokens,
-                    formula_masking=True,
-                    end_token="<END>",
-                    remove_token="<REMOVE>",
-                    special_tokens=[],
-                    min_formula_completion=self.min_formula_completion if self.prevent_early_termination else 0.0,
-                    allow_early_end_after_steps=self.allow_early_end_after_steps if self.prevent_early_termination else 0
-                )
-                
-                # Apply formula mask at token_id positions
-                for action_idx, is_allowed in enumerate(formula_action_mask):
-                    if not is_allowed:
-                        action_token = actions_list[action_idx]
-                        token_id = self.tok.token_to_id(action_token)
-                        # Mask out this token by setting a very negative value
-                        masked_logits[batch_idx, token_id] = float('-1e9')
-                
-            except Exception as e:
-                print(f"[WARN] Failed to apply formula mask for batch {batch_idx}: {e}")
-                # Continue without formula masking for this batch
+        # Formula-based masking is now handled by the environment's action mask
+        # The model just needs to provide full vocabulary logits
                 
         # Final check for NaN values
         if torch.isnan(masked_logits).any():
@@ -920,45 +997,11 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
             
         completion_status = []
         
+        # Simplified completion check - just check if molecules look complete
         for idx, current_selfies in enumerate(current_selfies_list):
-            target_formula = formula_list[idx] if idx < len(formula_list) else ""
-            
-            if not target_formula:
-                completion_status.append(False)
-                continue
-                
-            try:
-                # Get action mask
-                action_mask = self.get_action_mask_from_selfies_string(
-                    formula=target_formula,
-                    current_selfies=current_selfies,
-                    actions_list=actions_list,
-                    atom_tokens=self.atom_tokens,
-                    bonded_atom_tokens=self.bonded_atom_tokens,
-                    formula_masking=True,
-                    end_token="<END>",
-                    remove_token="<REMOVE>",
-                    special_tokens=[],
-                    min_formula_completion=self.min_formula_completion if self.prevent_early_termination else 0.0,
-                    allow_early_end_after_steps=self.allow_early_end_after_steps if self.prevent_early_termination else 0
-                )
-                
-                # Check if only END token is available
-                end_token_idx = actions_list.index("<END>") if "<END>" in actions_list else -1
-                
-                if end_token_idx >= 0:
-                    # Count available actions (excluding END token)
-                    available_non_end_actions = sum(action_mask) - (1 if action_mask[end_token_idx] else 0)
-                    is_complete = available_non_end_actions == 0 and action_mask[end_token_idx]
-                else:
-                    # If no END token, check if no actions are available
-                    is_complete = sum(action_mask) == 0
-                    
-                completion_status.append(is_complete)
-                
-            except Exception as e:
-                print(f"[WARN] Failed to check completion status: {e}")
-                completion_status.append(False)
+            # Basic completion check - can be enhanced later
+            is_complete = len(current_selfies) > 10  # Simple heuristic
+            completion_status.append(is_complete)
                 
         return completion_status
     
@@ -978,8 +1021,8 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         # Compute reward using global reward network only if action is end token
         if GLOBAL_REWARD_AVAILABLE and global_reward_network is not None:
             try:
-                # Get the token ID of the end token
-                end_token_id = self.tok.token_to_id("<END>") if hasattr(self.tok, 'token_to_id') else self.tok.end_token_id
+                # Get the token ID of the EOS token
+                eos_token_id = self.tokenizer.eos_token_id
                 
                 # Check if the current action is the end token (action contains token IDs directly)
                 action_token_ids = action.squeeze().long()
@@ -993,8 +1036,8 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
                 for batch_idx in range(batch_size):
                     current_token_id = action_token_ids[batch_idx].item() if batch_idx < len(action_token_ids) else action_token_ids[0].item()
                     
-                    # Only use reward network if this is the end token action
-                    if current_token_id == end_token_id:
+                    # Only use reward network if this is the EOS token action
+                    if current_token_id == eos_token_id:
                         current_selfies = current_selfies_list[batch_idx]
                         formula = formula_list[batch_idx] if batch_idx < len(formula_list) else ""
                         spectrum_embed = next_latent_state[batch_idx, :self.spectrum_dim]
@@ -1025,27 +1068,24 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         selfies_ids = next_latent_state[:, self.selfies_start_idx:self.formula_start_idx]
         
         # Clamp SELFIES token IDs to valid vocabulary range
-        vocab_size = len(self.tok.get_vocab())
+        vocab_size = len(self.tokenizer.get_vocab())
         selfies_ids_clamped = torch.clamp(selfies_ids.long(), 0, vocab_size - 1)
         
-        mask = (selfies_ids_clamped != self.tok.pad_token_id) & (selfies_ids_clamped != self.tok.end_token_id)
+        mask = (selfies_ids_clamped != self.tokenizer.pad_token_id) & (selfies_ids_clamped != self.tokenizer.sos_token_id)
 
         assert not torch.isnan(spectrum).any(), f"spectrum has nan: {spectrum}"
         assert not torch.isnan(selfies_ids_clamped).any(), f"selfies_ids_clamped has nan: {selfies_ids_clamped}"
         assert not torch.isnan(mask).any(), f"mask has nan: {mask}"
         
-        # Get full vocabulary logits
-        full_logits, value = self.transformer(spectrum, selfies_ids_clamped, mask)
-        assert not torch.isnan(full_logits).any(), f"full_logits has nan: {full_logits}"
-
-        # Apply formula-based action masking (includes basic action masking)
-        masked_logits = self._apply_formula_mask(full_logits, current_selfies_list, formula_list)
+        # Get full vocabulary logits - action_index = token_id
+        policy_logits, value = self.transformer(spectrum, selfies_ids_clamped, mask)
+        assert not torch.isnan(policy_logits).any(), f"policy_logits has nan: {policy_logits}"
         value = value.unsqueeze(-1)
         
         return MZNetworkOutput(
             value=value, 
             reward=reward, 
-            policy_logits=masked_logits, 
+            policy_logits=policy_logits, 
             latent_state=next_latent_state
         )
     
@@ -1063,27 +1103,105 @@ class MuZeroSelfiesTransformerEnhanced(MuZeroSelfiesTransformer):
         selfies_part = vec[:, self.selfies_start_idx:self.formula_start_idx]
         
         # Clamp SELFIES token IDs to valid vocabulary range to handle random data
-        vocab_size = len(self.tok.get_vocab())
+        vocab_size = len(self.tokenizer.get_vocab())
         selfies_part_clamped = torch.clamp(selfies_part.long(), 0, vocab_size - 1)
         
         # Create mask for transformer
-        mask = (selfies_part_clamped != self.tok.pad_token_id) & (selfies_part_clamped != self.tok.end_token_id)
+        mask = (selfies_part_clamped != self.tokenizer.pad_token_id) & (selfies_part_clamped != self.tokenizer.sos_token_id)
         
         # Use transformer directly for batch processing - get full vocabulary logits
-        full_logits, value = self.transformer(spectrum, selfies_part_clamped, mask)
-        
-        # Extract initial SELFIES (should be empty)
-        current_selfies_list = self._extract_selfies_from_latent_state(vec)
-        
-        # Apply formula masking to logits (includes basic action masking)
-        masked_logits = self._apply_formula_mask(full_logits, current_selfies_list, formula_list)
+        policy_logits, value = self.transformer(spectrum, selfies_part_clamped, mask)
         
         val = value.unsqueeze(-1)
-        pol = masked_logits
+        pol = policy_logits
         rew = [0.0] * B
 
         return MZNetworkOutput(value=val, reward=rew, policy_logits=pol, latent_state=obs)
 
+# Add the prediction functions for dynamic episode length
+def parse_molecular_formula_for_atoms_transformer(formula):
+    """
+    Parse a molecular formula and count total atoms.
+    
+    Args:
+        formula (str): Molecular formula like 'C6H12O6'
+        
+    Returns:
+        int: Total number of atoms
+    """
+    if not formula or formula == '':
+        return 0
+    
+    # Remove any charges, brackets, or other symbols for counting
+    clean_formula = re.sub(r'[+\-\[\]()]', '', formula)
+    
+    # Find all element-count pairs
+    # Pattern matches: Capital letter, optional lowercase, optional digits
+    pattern = r'([A-Z][a-z]?)(\d*)'
+    matches = re.findall(pattern, clean_formula)
+    
+    total_atoms = 0
+    for element, count_str in matches:
+        count = int(count_str) if count_str else 1
+        total_atoms += count
+    
+    return total_atoms
+
+def predict_episode_length_from_formula_transformer(formula, safety_margin=1.1):
+    """
+    Predict episode length for a given molecular formula based on empirical analysis.
+    
+    Args:
+        formula (str): Molecular formula
+        safety_margin (float): Additional safety margin (default: 1.1 = 10% extra)
+        
+    Returns:
+        dict: Prediction results including recommended max_steps
+    """
+    try:
+        atom_count = parse_molecular_formula_for_atoms_transformer(formula)
+        
+        if atom_count == 0:
+            return {
+                'predicted_max_steps': 100,  # Default fallback
+                'atom_count': 0,
+                'predicted_tokens': 0,
+                'upper_bound_tokens': 0,
+                'error': 'Could not parse formula'
+            }
+        
+        # Empirically derived linear relationship from analysis
+        # y = 0.594x + 12.508 (mean prediction)
+        # y < 0.594x + 47.774 (99% upper bound)
+        slope = 0.594
+        intercept = 12.508
+        upper_bound_intercept = 47.774
+        
+        predicted = slope * atom_count + intercept
+        upper_bound = slope * atom_count + upper_bound_intercept
+        
+        # Add safety margin and buffer
+        safe_upper_bound = upper_bound * safety_margin
+        recommended_max_steps = int(safe_upper_bound) + 5  # Additional buffer
+        
+        return {
+            'predicted_max_steps': recommended_max_steps,
+            'atom_count': atom_count,
+            'predicted_tokens': predicted,
+            'upper_bound_tokens': upper_bound,
+            'safe_upper_bound': safe_upper_bound,
+            'linear_equation': f"y = 0.594 * {atom_count} + 12.508 = {predicted:.1f}",
+            'upper_bound_equation': f"y < 0.594 * {atom_count} + 47.774 = {upper_bound:.1f}"
+        }
+        
+    except Exception as e:
+        return {
+            'predicted_max_steps': 100,  # Default fallback
+            'atom_count': 0,
+            'predicted_tokens': 0,
+            'upper_bound_tokens': 0,
+            'error': str(e)
+        }
 
 if __name__ == "__main__":
     # quick sanity check

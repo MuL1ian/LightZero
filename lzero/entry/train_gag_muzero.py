@@ -261,7 +261,7 @@ def train_gag_muzero(
             
             # DO NOT extend vocabulary - use exactly what the environment has
             print(f"GAG MuZero: Final vocabulary size: {len(vocab_dict)} tokens (no extension applied)")
-        
+
         collector.set_vocab_dict(vocab_dict)
             
         if get_rank() == 0:
@@ -315,15 +315,15 @@ def train_gag_muzero(
         eval_train_envstep_list = []
 
     # Evaluate the random agent
-    stop, reward = evaluator.eval(learner.save_checkpoint, learner.train_iter, collector.envstep)
+    stop, episode_info = evaluator.eval(learner.save_checkpoint, learner.train_iter, collector.envstep)
     
     # Log initial evaluation results to wandb
     if use_wandb and get_rank() == 0:
         log_to_wandb({
-            'evaluation/reward': reward,
+            'evaluation/reward': episode_info.get('reward_mean', 0.0),
             'evaluation/episode': 0,
             'evaluation/is_random_agent': True,
-        }, step=learner.train_iter + 1, prefix="")
+        })
 
     while True:
         log_buffer_memory_usage(learner.train_iter, replay_buffer, tb_logger)
@@ -338,7 +338,7 @@ def train_gag_muzero(
             }
             if hasattr(replay_buffer, 'get_buffer_stats'):
                 buffer_stats.update(replay_buffer.get_buffer_stats())
-            log_to_wandb(buffer_stats, step=learner.train_iter + 1)
+            log_to_wandb(buffer_stats)
         
         collect_kwargs = {}
         # set temperature for visit count distributions according to the train_iter,
@@ -368,7 +368,7 @@ def train_gag_muzero(
                 'exploration/epsilon': collect_kwargs['epsilon'],
                 'training/env_step': collector.envstep,
                 'training/train_iter': learner.train_iter,
-            }, step=learner.train_iter + 1)
+            })
 
         # Evaluate policy performance.
         if evaluator.should_eval(learner.train_iter):
@@ -376,27 +376,27 @@ def train_gag_muzero(
                 eval_train_iter_list.append(learner.train_iter)
                 eval_train_envstep_list.append(collector.envstep)
             else:
-                stop, reward = evaluator.eval(learner.save_checkpoint, learner.train_iter, collector.envstep)
+                stop, episode_info = evaluator.eval(learner.save_checkpoint, learner.train_iter, collector.envstep)
                 
                 # Enhanced evaluation logging to wandb
                 if use_wandb and get_rank() == 0:
                     eval_data = {
-                        'evaluation/reward': reward,
+                        'evaluation/reward': episode_info.get('reward_mean', 0.0),
                         'evaluation/train_iter': learner.train_iter,
                         'evaluation/env_step': collector.envstep,
                         'evaluation/is_random_agent': False,
                     }
                     
-                    # Add more evaluation metrics if available
-                    if hasattr(evaluator, 'get_eval_metrics'):
-                        eval_metrics = evaluator.get_eval_metrics()
-                        for key, value in eval_metrics.items():
+                    # Add more evaluation metrics from episode_info
+                    for key, value in episode_info.items():
+                        if isinstance(value, (int, float)) and key not in ['train_iter', 'ckpt_name']:
                             eval_data[f'evaluation/{key}'] = value
                     
-                    log_to_wandb(eval_data, step=learner.train_iter + 1)
+                    log_to_wandb(eval_data)
                     
                     # Log evaluation milestone
-                    logging.info(f"Evaluation at iter {learner.train_iter}: reward={reward:.4f}, env_step={collector.envstep}")
+                    reward_mean = episode_info.get('reward_mean', 0.0)
+                    logging.info(f"Evaluation at iter {learner.train_iter}: reward={reward_mean:.4f}, env_step={collector.envstep}")
                 
                 if stop:
                     break
@@ -477,7 +477,7 @@ def train_gag_muzero(
                                 'gag/buffer_total_count': getattr(collector, '_total_trajectories_in_buffer', 0),
                             })
                         
-                        log_to_wandb(gag_data, step=learner.train_iter + 1)
+                        log_to_wandb(gag_data)
                     
                     if tb_logger:
                         tb_logger.add_scalar('gag_muzero/collected_pairs_count', len(gag_pairs), learner.train_iter)
@@ -530,7 +530,7 @@ def train_gag_muzero(
                     'collection/buffer_gt_target': getattr(collector, '_target_gt_ratio', 0.3),
                 })
             
-            log_to_wandb(collection_summary, step=learner.train_iter + 1)
+            log_to_wandb(collection_summary)
 
         # Learn policy from collected data.
         for i in range(update_per_collect):
@@ -595,7 +595,7 @@ def train_gag_muzero(
                             if isinstance(value, (int, float)):
                                 training_losses[f'training/{key}'] = value
                     
-                    log_to_wandb(training_losses, step=learner.train_iter + 1)
+                    log_to_wandb(training_losses)
 
             # ==============================================================
             # GAG MuZero specific training logging
@@ -636,7 +636,7 @@ def train_gag_muzero(
                             if 'reward_gap' in train_info:
                                 gag_training_losses['gag_rewards/reward_gap'] = train_info['reward_gap']
                             
-                            log_to_wandb(gag_training_losses, step=learner.train_iter + 1)
+                            log_to_wandb(gag_training_losses)
                         
                         if tb_logger is not None:
                             tb_logger.add_scalar('gag_muzero/adversarial_loss', train_info['adversarial_loss'], learner.train_iter)
@@ -697,26 +697,32 @@ def train_gag_muzero(
                     ckpt_path = os.path.join(ckpt_dirname, ckpt_name)
                     # load the ckpt of pretrained model
                     policy.learn_mode.load_state_dict(torch.load(ckpt_path, map_location=cfg.policy.device))
-                    stop, reward = evaluator.eval(learner.save_checkpoint, train_iter, collector_envstep)
+                    stop, episode_info = evaluator.eval(learner.save_checkpoint, train_iter, collector_envstep)
+                    
+                    reward_mean = episode_info.get('reward_mean', 0.0)
                     
                     # Log offline evaluation results to wandb
                     if use_wandb and get_rank() == 0:
                         offline_eval_data = {
-                            'offline_eval/reward': reward,
+                            'offline_eval/reward': reward_mean,
                             'offline_eval/train_iter': train_iter,
                             'offline_eval/env_step': collector_envstep,
                             'offline_eval/checkpoint_index': eval_idx,
                         }
-                        log_to_wandb(offline_eval_data, step=max(1, train_iter))
+                        # Add other metrics from episode_info
+                        for key, value in episode_info.items():
+                            if isinstance(value, (int, float)) and key not in ['train_iter', 'ckpt_name']:
+                                offline_eval_data[f'offline_eval/{key}'] = value
+                        log_to_wandb(offline_eval_data)
                     
                     offline_eval_results.append({
                         'train_iter': train_iter,
                         'collector_envstep': collector_envstep,
-                        'reward': reward
+                        'reward': reward_mean
                     })
                     
                     logging.info(
-                        f'eval offline at train_iter: {train_iter}, collector_envstep: {collector_envstep}, reward: {reward}')
+                        f'eval offline at train_iter: {train_iter}, collector_envstep: {collector_envstep}, reward: {reward_mean}')
                 
                 # Log offline evaluation summary
                 if use_wandb and get_rank() == 0 and offline_eval_results:
@@ -728,7 +734,7 @@ def train_gag_muzero(
                         'offline_eval_summary/avg_reward': sum(rewards) / len(rewards),
                         'offline_eval_summary/reward_improvement': rewards[-1] - rewards[0] if len(rewards) > 1 else 0,
                     }
-                    log_to_wandb(offline_summary, step=learner.train_iter + 1)
+                    log_to_wandb(offline_summary)
                 
                 logging.info(f'eval offline finished!')
             break
@@ -763,7 +769,7 @@ def train_gag_muzero(
                             if isinstance(value, (int, float)):
                                 final_training_stats[f'final_collector/{key}'] = value
             
-            log_to_wandb(final_training_stats, step=learner.train_iter + 1)
+            log_to_wandb(final_training_stats)
             
             # Log training completion milestone
             logging.info(f"Training completed: {learner.train_iter} iterations, {collector.envstep} env steps")
@@ -785,7 +791,7 @@ def train_gag_muzero(
                             logging.info(f"Final GAG {key}: {value}")
                     
                     if detailed_final_stats:
-                        log_to_wandb(detailed_final_stats, step=learner.train_iter + 1)
+                        log_to_wandb(detailed_final_stats)
             else:
                 logging.info("GAG MuZero Training Complete - Statistics method not available")
 
@@ -802,7 +808,7 @@ def train_gag_muzero(
                 'experiment/wandb_freq_used': wandb_freq,
                 'experiment/success': 1.0,
             }
-            log_to_wandb(experiment_metadata, step=learner.train_iter + 1)
+            log_to_wandb(experiment_metadata)
         
         wandb.finish()
     

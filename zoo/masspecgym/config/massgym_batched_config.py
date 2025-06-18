@@ -13,11 +13,14 @@ from easydict import EasyDict
 from lzero.model import global_reward_network
 
 # Number of environments for training
-collector_env_num = 256
-evaluator_env_num = 256
+collector_env_num = 128
+evaluator_env_num = 128
 debug = False
 batch_size = 256
-max_moves = 80
+max_moves = 100
+replay_buffer_size = 250000
+update_per_collect = 10
+
 # NEW: Configure reward server for subprocess-based environments
 # The reward server runs in a dedicated process and handles batched reward computation
 # for all environment subprocesses, solving the multiprocessing limitations of the old system
@@ -86,9 +89,18 @@ massgym_batched_config = dict(
         manager=dict(shared_memory=False),
         
         # SELFIES and formula settings
-        max_len=100,
+        max_len=150,
         formula_masking=True,
         formula_max_len=50,  # Fixed: match model config
+        
+        # Dynamic episode length prediction
+        use_dynamic_max_steps=True,     # Enable dynamic max steps based on formula
+        dynamic_safety_margin=1.1,     # 10% safety margin on top of predicted upper bound
+        
+        # Intelligent END token masking to prevent early termination
+        prevent_early_termination=True,      # Whether to prevent early END token selection
+        min_formula_completion=0.8,          # Minimum completion ratio before END is allowed  
+        allow_early_end_after_steps=20,      # Allow END after this many steps even if incomplete
         
         # Rendering settings
         render_mode=None,
@@ -139,7 +151,7 @@ massgym_batched_config = dict(
         
         # Model settings
         model=dict(
-            observation_shape=4246,  # 4096 (spectrum) + 100 (SELFIES max_len) + 50 (formula_max_len)
+            observation_shape=4296,  # 4096 (spectrum) + 150 (SELFIES max_len) + 50 (formula_max_len)
             action_space_size=75,    # Updated to match vocabulary size (includes all tokens)
             model_type='mlp',
             categorical_distribution=False,
@@ -150,6 +162,15 @@ massgym_batched_config = dict(
             pretrained_transformer_path="pretrained_selfies_transformer/best_model.pt",
             formula_max_len=50,  # Ensure model matches environment observation structure
             load_pretrained_transformer=True,
+            
+            # Dynamic episode length prediction for transformer
+            use_dynamic_max_steps=True,     # Enable dynamic max steps in transformer
+            dynamic_safety_margin=1.1,     # 10% safety margin on top of predicted upper bound
+            
+            # Intelligent END token masking to prevent early termination
+            prevent_early_termination=True,     # Whether to prevent early END token selection
+            min_formula_completion=0.8,         # Minimum completion ratio before END is allowed  
+            allow_early_end_after_steps=20,     # Allow END after this many steps even if incomplete
         ),
         
         # Required policy settings
@@ -168,7 +189,7 @@ massgym_batched_config = dict(
         learning_rate=1e-4,
         num_simulations=32,
         max_moves=max_moves,
-        update_per_collect=1,
+        update_per_collect=update_per_collect,
         optim_type='Adam',
         
         # Additional required parameters
@@ -178,7 +199,7 @@ massgym_batched_config = dict(
         reanalyze_ratio=0.0,
         n_episode=collector_env_num,
         eval_freq=int(50),
-        replay_buffer_size=int(1e2),
+        replay_buffer_size=int(replay_buffer_size),
         collector_env_num=collector_env_num,
         evaluator_env_num=evaluator_env_num,
         discount_factor=0.99,
@@ -241,7 +262,7 @@ massgym_batched_config = dict(
     
     # Replay buffer settings
     replay_buffer=dict(
-        replay_buffer_size=int(5e5),
+        replay_buffer_size=int(replay_buffer_size),
         batch_size=batch_size,
     ),
 )

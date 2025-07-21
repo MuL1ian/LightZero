@@ -21,7 +21,7 @@ from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
 # Model imports
-from lzero.model.selfies_tokenizer import SelfiesTokenizer
+from lzero.model.muzero_transformer import SelfiesTokenizer
 from lzero.model.pretrain.run_pretrain import RealSpectrumSelfiesDataset, load_pretrained_model
 
 # =============================================================================
@@ -289,24 +289,20 @@ def generate_selfies_candidates_batch(
     device: torch.device, 
     num_candidates: int = 100,
     max_len: Optional[int] = None,
-    temperature: float = 1.0,
-    top_k: int = 0,
-    top_p: float = 0.9
+    temperature: float = 1.0
 ) -> List[List[str]]:
     """
-    Generate multiple SELFIES candidates for a batch of spectrums using batch inference
+    Generate multiple SELFIES candidates for a batch of spectrums using model.generate()
     
     Args:
-        model: Trained model
+        model: Trained model (MassSelfiesED with generate method)
         spectrums: Input spectrum embeddings [batch_size, 4096]
         tokenizer: SELFIES tokenizer
         config: Model configuration
         device: Device
         num_candidates: Number of candidates to generate per sample
         max_len: Maximum generation length
-        temperature: Sampling temperature
-        top_k: Top-k sampling parameter
-        top_p: Top-p (nucleus) sampling parameter
+        temperature: Sampling temperature from model.generate()
     
     Returns:
         List of lists, where each inner list contains generated SELFIES for one sample
@@ -326,102 +322,52 @@ def generate_selfies_candidates_batch(
     # Generate num_candidates for each sample
     for k_idx in range(num_candidates):
         with torch.no_grad():
-            # Initialize generation sequences [batch_size, 1]
-            generated_tokens = torch.full((batch_size, 1), tokenizer.sos_token_id, dtype=torch.long, device=device)
-            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-            
-            # Generate sequence step by step
-            for step in range(max_len):
-                seq_len = generated_tokens.size(1)
-                if seq_len >= config.max_len - 1:
-                    break
+            # Use model's native generate method for true autoregressive generation
+            try:
+                # Convert spectrums to the expected format
+                generated_tokens, attention_mask = model.generate(
+                    spectrum_input=spectrums,  # [batch_size, 4096]
+                    max_len=max_len,
+                    temperature=temperature,
+                    greedy=(temperature == 0.0),
+                    stop_at_eos=True
+                )
+                # generated_tokens: [batch_size, max_len]
+                # attention_mask: [batch_size, max_len]
                 
-                # Prepare input tensor [batch_size, config.max_len-1]
-                input_tensor = torch.full((batch_size, config.max_len - 1), tokenizer.pad_token_id, dtype=torch.long, device=device)
-                input_tensor[:, :seq_len] = generated_tokens
-                attention_mask = (input_tensor != tokenizer.pad_token_id).float()
-                
-                # Batch forward pass
-                try:
-                    output = model.forward_pretrain(spectrums, input_tensor, attention_mask, return_value=False)
-                    if isinstance(output, tuple):
-                        logits = output[0]
-                    else:
-                        logits = output
-                except Exception as e:
-                    print(f"Warning: Batch forward pass failed: {e}")
-                    break
-                
-                # Get logits for next token [batch_size, vocab_size]
-                next_token_logits = logits[:, seq_len-1, :]
-                
-                # Apply sampling strategy
-                if temperature == 0:  # Greedy
-                    next_tokens = torch.argmax(next_token_logits, dim=-1)
-                else:  # Sampling
-                    # Temperature scaling
-                    scaled_logits = next_token_logits / temperature
+                # Decode generated token sequences for this k-th generation
+                current_generated_selfies_list = []
+                for i in range(batch_size):
+                    tokens = generated_tokens[i].tolist()
                     
-                    # Top-k filtering
-                    if top_k > 0:
-                        indices_to_remove = scaled_logits < torch.topk(scaled_logits, top_k)[0][..., -1, None]
-                        scaled_logits[indices_to_remove] = float('-inf')
+                    # Remove SOS token if first token is SOS (first token)
+                    if len(tokens) > 0 and tokens[0] == tokenizer.sos_token_id:
+                        tokens = tokens[1:]
                     
-                    # Top-p filtering
-                    if top_p < 1.0:
-                        sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
-                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                        
-                        # Remove tokens with cumulative probability above the threshold
-                        sorted_indices_to_remove = cumulative_probs > top_p
-                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        sorted_indices_to_remove[..., 0] = 0
-                        
-                        indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
-                        scaled_logits[indices_to_remove] = float('-inf')
+                    # Remove EOS and PAD tokens
+                    if tokenizer.eos_token_id in tokens:
+                        eos_idx = tokens.index(tokenizer.eos_token_id)
+                        tokens = tokens[:eos_idx]
+                    if tokenizer.pad_token_id in tokens:
+                        pad_idx = tokens.index(tokenizer.pad_token_id)
+                        tokens = tokens[:pad_idx]
                     
-                    # Sample
-                    probs = F.softmax(scaled_logits, dim=-1)
-                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                    try:
+                        selfies_str = tokenizer.decode_to_selfies(tokens, skip_special_tokens=True)
+                        current_generated_selfies_list.append(selfies_str)
+                    except Exception as e:
+                        print(f"Warning: Failed to decode tokens {tokens}: {e}")
+                        current_generated_selfies_list.append("")  # Failed to decode
                 
-                # Check for end conditions
-                is_end = (next_tokens == tokenizer.eos_token_id) | (next_tokens == tokenizer.pad_token_id)
-                finished = finished | is_end
-                
-                # If all sequences finished and at least one token generated, stop
-                if finished.all() and step > 0:
-                    break
-                
-                # Add new tokens
-                next_tokens = next_tokens.unsqueeze(1)
-                generated_tokens = torch.cat([generated_tokens, next_tokens], dim=1)
-                
-                # For finished sequences, set new token to pad
-                generated_tokens[finished, -1] = tokenizer.pad_token_id
-            
-            # Decode generated token sequences for this k-th generation
-            current_generated_selfies_list = []
-            for i in range(batch_size):
-                tokens = generated_tokens[i].tolist()[1:]  # Remove SOS token
-                
-                # Remove EOS and PAD tokens
-                if tokenizer.eos_token_id in tokens:
-                    eos_idx = tokens.index(tokenizer.eos_token_id)
-                    tokens = tokens[:eos_idx]
-                if tokenizer.pad_token_id in tokens:
-                    pad_idx = tokens.index(tokenizer.pad_token_id)
-                    tokens = tokens[:pad_idx]
-                
-                try:
-                    selfies_str = tokenizer.decode_to_selfies(tokens, skip_special_tokens=True)
-                    current_generated_selfies_list.append(selfies_str)
-                except Exception as e:
-                    print(f"Warning: Failed to decode tokens {tokens}: {e}")
-                    current_generated_selfies_list.append("")  # Failed to decode
-            
-            # Add current k-th generation to total results
-            for i in range(batch_size):
-                all_generated_selfies_lists[i].append(current_generated_selfies_list[i])
+                # Add current k-th generation to total results
+                for i in range(batch_size):
+                    all_generated_selfies_lists[i].append(current_generated_selfies_list[i])
+                    
+            except Exception as e:
+                print(f"Warning: model.generate failed for candidate {k_idx}: {e}")
+                # Fallback: add empty strings for this generation
+                for i in range(batch_size):
+                    all_generated_selfies_lists[i].append("")
 
     return all_generated_selfies_lists
 
@@ -434,9 +380,7 @@ def generate_selfies_candidates(
     device: torch.device, 
     num_candidates: int = 100,
     max_len: Optional[int] = None,
-    temperature: float = 1.0,
-    top_k: int = 0,
-    top_p: float = 0.9
+    temperature: float = 1.0
 ) -> List[str]:
     """
     Generate multiple SELFIES candidates for a single spectrum (backward compatibility)
@@ -453,9 +397,7 @@ def generate_selfies_candidates(
         device=device,
         num_candidates=num_candidates,
         max_len=max_len,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p
+        temperature=temperature
     )
     
     return batch_results[0]  # Return results for the single sample
@@ -536,8 +478,8 @@ def evaluate_model_diffms_style(
     )
     
     # Initialize DiffMS-style metrics
-    k_values = list(range(1, min(num_candidates + 1, 21)))  # Top-1 to Top-20
-    
+    k_values = list(range(1, min(num_candidates + 1, 101)))  # Top-1 to Top-100 (or num_candidates if smaller)
+
     test_k_acc = K_ACC_Collection(k_values)
     test_sim_metrics = K_SimilarityCollection(k_values)
     test_validity = Validity()
@@ -576,9 +518,7 @@ def evaluate_model_diffms_style(
                 config=config,
                 device=device,
                 num_candidates=num_candidates,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p
+                temperature=temperature
             )
             
             # Process each sample in the batch
@@ -642,9 +582,7 @@ def evaluate_model_diffms_style(
                         config=config,
                         device=device,
                         num_candidates=num_candidates,
-                        temperature=temperature,
-                        top_k=top_k,
-                        top_p=top_p
+                        temperature=temperature
                     )
                     
                     # Convert to molecules
@@ -717,13 +655,13 @@ def evaluate_model_diffms_style(
     
     # Log top-K accuracies
     logger.info("Top-K Accuracies:")
-    for k in [1, 5, 10, 20]:
+    for k in [1, 5, 10, 20, 50, 100]:
         if f"acc_at_{k}" in k_acc_results:
             logger.info(f"  Top-{k}: {k_acc_results[f'acc_at_{k}']:.4f}")
     
     # Log similarities
     logger.info("Top-K Tanimoto Similarities:")
-    for k in [1, 5, 10, 20]:
+    for k in [1, 5, 10, 20, 50, 100]:
         if f"tanimoto_at_{k}" in sim_results:
             logger.info(f"  Top-{k}: {sim_results[f'tanimoto_at_{k}']:.4f}")
     
@@ -741,8 +679,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate SELFIES model using DiffMS-style metrics")
     
     # Required arguments
-    parser.add_argument("--model_path", type=str, required=True, help="Path to trained model checkpoint")
-    parser.add_argument("--test_data_path", type=str, required=True, help="Path to test dataset")
+    parser.add_argument("--model_path", type=str, default="/hy-tmp/MassEnv/main/LightZero/lzero/model/pretrain/pretrained_selfies_transformer/final_model.pt", help="Path to trained model checkpoint")
+    parser.add_argument("--test_data_path", type=str, default="/hy-tmp/MassEnv/DataLoader/test_spectrum_embeds_msg.pt", help="Path to test dataset")
     
     # Evaluation parameters
     parser.add_argument("--num_candidates", type=int, default=10, help="Number of candidates per sample (like test_samples_to_generate)")
@@ -751,7 +689,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (cuda/cpu)")
     
     # Generation parameters
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
+    parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
     parser.add_argument("--top_k", type=int, default=0, help="Top-k sampling (0 = disabled)")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling")
     
@@ -787,11 +725,16 @@ def main():
     print(f"Validity: {results['metrics']['validity']:.4f}")
     print(f"Top-1 Accuracy: {results['metrics']['accuracy'].get('acc_at_1', 0):.4f}")
     print(f"Top-10 Accuracy: {results['metrics']['accuracy'].get('acc_at_10', 0):.4f}")
+    print(f"Top-50 Accuracy: {results['metrics']['accuracy'].get('acc_at_50', 0):.4f}")
+    print(f"Top-100 Accuracy: {results['metrics']['accuracy'].get('acc_at_100', 0):.4f}")
     print(f"Top-1 cosine similarity: {results['metrics']['similarity'].get('cosine_at_1', 0):.4f}")
-    print(f"Top-1 tanimoto similarity: {results['metrics']['similarity'].get('tanimoto_at_1', 0):.4f}")
     print(f"Top-10 cosine similarity: {results['metrics']['similarity'].get('cosine_at_10', 0):.4f}")
+    print(f"Top-50 cosine similarity: {results['metrics']['similarity'].get('cosine_at_50', 0):.4f}")
+    print(f"Top-100 cosine similarity: {results['metrics']['similarity'].get('cosine_at_100', 0):.4f}")
+    print(f"Top-1 tanimoto similarity: {results['metrics']['similarity'].get('tanimoto_at_1', 0):.4f}")
     print(f"Top-10 tanimoto similarity: {results['metrics']['similarity'].get('tanimoto_at_10', 0):.4f}")
-
+    print(f"Top-50 tanimoto similarity: {results['metrics']['similarity'].get('tanimoto_at_50', 0):.4f}")
+    print(f"Top-100 tanimoto similarity: {results['metrics']['similarity'].get('tanimoto_at_100', 0):.4f}")
 
 
 if __name__ == "__main__":

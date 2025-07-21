@@ -5,6 +5,7 @@ This module contains all configuration classes to avoid duplication across files
 """
 
 from dataclasses import dataclass
+from typing import Optional
 import torch
 
 
@@ -22,47 +23,50 @@ class PretrainConfig:
     #atten dim of spectrum decomposer = spectrum_chunk_size / spectrum_attention_heads suggest  > 64
     dropout: float = 0.15  
     
+    
+    enable_spectrum_encoder: bool = False  # False = 纯baseline模式，直接使用预处理的4096维embeddings
+    spectrum_encoder_checkpoint: Optional[str] = None  # spectrum encoder checkpoint路径（当enable_spectrum_encoder=True时使用）
+    
     # Training parameters 
-    batch_size: int = 128        
-    learning_rate: float = 4e-5  
-    num_epochs: int = 12
-    warmup_steps: int = 1500      
+    batch_size: int = 64         #
+    learning_rate: float = 1e-4   
+    num_epochs: int = 70
+    warmup_steps: int = 330    
     gradient_clip: float = 1.0    
-    weight_decay: float = 0.02    
+    weight_decay: float = 0.01    #
     
     # Value head training parameters
-    train_value_head: bool = True               # whether to train value head
-    value_loss_weight: float = 0.2             # weight for value loss
+    train_value_head: bool = False              # 改为False - 只训练auto-regressive baseline
+    value_loss_weight: float = 0.0             # 设为0.0 - 不使用value loss
     
-    # Value warmup parameters
-    enable_value_warmup: bool = True           # whether to enable value training warmup
+    # Value warmup parameters (当train_value_head=False时这些参数无效)
+    enable_value_warmup: bool = False           # 禁用value warmup
     value_warmup_steps: int = 2000             # number of steps to warmup value training (policy trains alone first)
     
-    # Value training strategy parameters
+    # Value training strategy parameters (当train_value_head=False时这些参数无效)
     value_training_strategy: str = "teacher_forcing"  # "teacher_forcing" or "corrupted_sequences"
-    add_noise_to_value_labels: bool = True      # add noise to value labels for robustness
-    value_noise_prob: float = 0.1              # probability of flipping value labels
+    add_noise_to_value_labels: bool = False      
+    value_noise_prob: float = 0.0              
     
-    # Early stopping
-    early_stopping_patience: int = 8
-    early_stopping_min_delta: float = 0.01 
+    # Early stopping - 
+    early_stopping_patience: int = 15          
+    early_stopping_min_delta: float = 0.005    
     save_best_model: bool = True
     
     # Data parameters (spectrum fingerprint)
     spectrum_dim: int = 4096
     
-    # Save parameters
-    save_dir: str = "./pretrained_model-teacherforcing-value"
-    log_interval: int = 200
-    save_interval: int = 1000
+    # Save parameters - 
+    save_dir: str = "./pretrained_selfies_transformer"
+    log_interval: int = 100       
+    save_interval: int = 350    
     
     # Device
     device: str = "cuda"
     
     # Dataset parameters
-<<<<<<< HEAD
-    train_data_file: str = "/home/zirui/MassEnv/DataLoader/train_spectrum_embeds_msg.pt"
-    val_data_file: str = "/home/zirui/MassEnv/DataLoader/val_spectrum_embeds_msg.pt"
+    train_data_file: str = "/hy-tmp/MassEnv/DataLoader/train_spectrum_embeds_msg.pt"
+    val_data_file: str = "/hy-tmp/MassEnv/DataLoader/val_spectrum_embeds_msg.pt"
 
 
 @dataclass
@@ -73,10 +77,5 @@ class EvaluationConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     k_predictions: int = 1
     temperature: float = 0.0
-    test_data_file: str = "/home/zirui/MassEnv/DataLoader/test_spectrum_embeds_msg.pt"
+    test_data_file: str = "/hy-tmp/MassEnv/DataLoader/test_spectrum_embeds_msg.pt"
     results_dir: str = "./evaluation_results" 
-=======
-    train_data_file: str = "/hy-tmp/MassEnv/DataLoader/train_spectrum_embeds_msg.pt"
-    val_data_file: str = "/hy-tmp/MassEnv/DataLoader/val_spectrum_embeds_msg.pt"
-
->>>>>>> 458e2b62532f853ada563c7fafe3a977da2d5c4c

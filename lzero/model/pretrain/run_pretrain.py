@@ -8,16 +8,12 @@ from typing import List, Dict, Tuple, Optional, Union
 import json
 import os
 from tqdm import tqdm
-import wandb
-from dataclasses import dataclass
 import selfies as sf
 import csv
 import argparse
-import time
-import random
-
-from lzero.model.muzero_transformer import MassSelfiesED, SelfiesTokenizer
+from lzero.model.muzero_transformer import MassSelfiesED,SelfiesTokenizer
 from config import PretrainConfig
+# import selfies as sf
 
 
 class RealSpectrumSelfiesDataset(Dataset):
@@ -30,22 +26,20 @@ class RealSpectrumSelfiesDataset(Dataset):
         print(f"Loading real spectrum data from: {data_file}")
         self.data = torch.load(data_file, map_location='cpu')
         
-        # check data format
-        required_keys = ['embeds', 'smiles', 'formulas']
+        required_keys = ['embeds', 'smiles', 'formulas','selfies']
         for key in required_keys:
             if key not in self.data:
                 raise KeyError(f"Missing key '{key}' in dataset file: {data_file}")
         
-        print("Converting SMILES to SELFIES...")
         self.selfies_list = []
         valid_indices = []
         tokenizer_failed = 0
         
-        for i, smiles in enumerate(tqdm(self.data['smiles'], desc="Converting SMILES")):
+        # Use pre-computed SELFIES directly, only validate tokenizer compatibility
+        for i, selfies in enumerate(tqdm(self.data['selfies'], desc="Validating SELFIES")):
             try:
-                selfies = sf.encoder(smiles)
                 if selfies and len(selfies) > 0: 
-                    # extra check: validate if tokenizer can handle this SELFIES
+                    # validate if tokenizer can handle this SELFIES
                     try:
                         # test encoding
                         encoded_tokens = self.tokenizer.encode_selfies(selfies, add_special_tokens=False)
@@ -65,14 +59,23 @@ class RealSpectrumSelfiesDataset(Dataset):
                         if tokenizer_failed <= 5:  
                             print(f"[WARN] Tokenizer failed for SELFIES '{selfies}': {tokenizer_error}")
             except Exception as e:
+                tokenizer_failed += 1
+                if tokenizer_failed <= 5:
+                    print(f"[WARN] SELFIES processing error: {e}")
                 continue
         
         if tokenizer_failed > 0:
-            print(f"[INFO] Tokenizer compatibility check: {tokenizer_failed} SELFIES failed validation (over long SELFIES)")
+            print(f"[INFO] Tokenizer compatibility check: {tokenizer_failed} SELFIES failed validation")
         
         # filter valid data
         self.embeds = self.data['embeds'][valid_indices]
         self.formulas = [self.data['formulas'][i] for i in valid_indices]
+        
+        # Optional: store token counts if available for potential future use
+        if 'token_counts' in self.data:
+            self.token_counts = [self.data['token_counts'][i] for i in valid_indices]
+        else:
+            self.token_counts = None
         
         print(f"Loaded {len(self.selfies_list)} valid samples from {len(self.data['smiles'])} total samples")
         print(f"Spectrum embeddings shape: {self.embeds.shape}")
@@ -84,45 +87,34 @@ class RealSpectrumSelfiesDataset(Dataset):
         spectrum = self.embeds[idx].float()  # [4096]
         selfies = self.selfies_list[idx]
         
-        ground_truth_tokens = [self.tokenizer.sos_token_id]
         try:
-            import selfies as sf
-            selfies_token_list = list(sf.split_selfies(selfies))
-            
-            selfies_tokens = []
-            vocab = self.tokenizer.get_vocab()
-            for token in selfies_token_list:
-                if token in vocab:
-                    selfies_tokens.append(vocab[token])
-                else:
-                    print(f"Warning: Unknown SELFIES token: {token}")
-                    continue
-            
-            max_selfies_len = self.max_len - 2
-            if len(selfies_tokens) > max_selfies_len:
-                selfies_tokens = selfies_tokens[:max_selfies_len]
-            
-            ground_truth_tokens.extend(selfies_tokens)
-            ground_truth_tokens.append(self.tokenizer.eos_token_id)
+            encoding = self.tokenizer.encode(
+                        list(sf.split_selfies(selfies)),
+                        is_pretokenized=True,
+                        add_special_tokens=True
+                    )
+                    
+            full_token_ids = torch.tensor(encoding.ids, dtype=torch.long)
+            attention_mask = torch.tensor(encoding.attention_mask, dtype=torch.float)
+
         except Exception as e:
             print(f"Warning: Failed to encode SELFIES '{selfies}': {e}")
-            ground_truth_tokens = [self.tokenizer.sos_token_id, self.tokenizer.eos_token_id]
+            full_token_ids = torch.full((self.max_len,), self.tokenizer.pad_token_id, dtype=torch.long)
+            attention_mask = torch.zeros(self.max_len, dtype=torch.float)
         
 
-        input_ids = torch.tensor(ground_truth_tokens[:-1], dtype=torch.long)  # [SOS, tokens...]
-        target_ids = torch.tensor(ground_truth_tokens[1:], dtype=torch.long)   # [tokens..., EOS]
-        
-        max_seq_len = self.max_len - 1
-        
-        if len(input_ids) < max_seq_len:
-            pad_len = max_seq_len - len(input_ids)
+        input_ids = full_token_ids[:-1]
+        target_ids = full_token_ids[1:]
+        attention_mask = attention_mask[:-1]
+
+        if len(input_ids) != self.max_len - 1:
+            print(f"Error: length mismatch. Expected {self.max_len - 1}, got {len(input_ids)}")
+            # 进行填充
+            pad_len = (self.max_len - 1) - len(input_ids)
             input_ids = torch.cat([input_ids, torch.full((pad_len,), self.tokenizer.pad_token_id, dtype=torch.long)])
-        
-        if len(target_ids) < max_seq_len:
-            pad_len = max_seq_len - len(target_ids)
             target_ids = torch.cat([target_ids, torch.full((pad_len,), self.tokenizer.pad_token_id, dtype=torch.long)])
-        
-        attention_mask = (input_ids != self.tokenizer.pad_token_id).float()
+            attention_mask = torch.cat([attention_mask, torch.zeros(pad_len, dtype=torch.float)])
+            
         
         return {
             'spectrum': spectrum,
@@ -242,7 +234,9 @@ def create_model(config: PretrainConfig) -> MassSelfiesED:
         spectrum_chunk_size=config.spectrum_chunk_size,
         spectrum_attention_heads=config.spectrum_attention_heads,
         dropout=config.dropout,
-        device=config.device
+        device=config.device,
+        enable_spectrum_encoder=config.enable_spectrum_encoder,
+        spectrum_encoder_checkpoint=config.spectrum_encoder_checkpoint
     )
 
 # not check 
@@ -573,6 +567,7 @@ def pretrain_transformer(config: PretrainConfig):
     # Early stopping variables
     best_val_loss = float('inf')
     patience_counter = 0
+    current_val_loss = None  
     
     # training statistics
     training_stats = {
@@ -739,7 +734,6 @@ def pretrain_transformer(config: PretrainConfig):
             # save checkpoint and validation
             if global_step % config.save_interval == 0:
                 # Run validation before saving checkpoint
-                current_val_loss = None
                 if val_loader:
                     model.eval()
                     val_losses = []

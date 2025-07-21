@@ -227,7 +227,7 @@ class MassSelfiesED(nn.Module):
         self.device = torch.device(device)
         self.spectrum_dim = 4096
         self.spectrum_chunk_size = spectrum_chunk_size
-        self.spectrum_attention_heads = spectrum_attention_heads  # 清晰命名
+        self.spectrum_attention_heads = spectrum_attention_heads 
         self.n_head = n_head
         self.d_model = d_model
         self.enable_spectrum_encoder = enable_spectrum_encoder
@@ -541,72 +541,110 @@ class MassSelfiesED(nn.Module):
             max_len = self.tokenizer.max_len
         assert max_len > 1, "max_len must be at least 2"
 
-        # ------------------------------------------------------------------
-        # Initialise sequence with SOS (+ optional prefix)
-        # ------------------------------------------------------------------
-        sos_id = self.sos_token_id
-        eos_id = self.eos_token_id
-        pad_id = self.pad_token_id
+        sos_id = self.tokenizer.sos_token_id
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id
+        unk_id = self.tokenizer.unk_token_id
 
+        # Initialize sequence with SOS (+ optional prefix)
         if prefix_ids is not None:
             prefix_ids = prefix_ids.to(device).long()
-            # Ensure batch size matches
             if prefix_ids.dim() == 1:
                 prefix_ids = prefix_ids.unsqueeze(0)
             assert prefix_ids.size(0) == batch_size, "prefix batch dim mismatch"
-            tokens = torch.cat([torch.full((batch_size, 1), sos_id, device=device, dtype=torch.long),
-                                prefix_ids], dim=1)
+            
+            # Check if all sequences in the batch start with SOS
+            if prefix_ids.size(1) > 0 and (prefix_ids[:, 0] == sos_id).all():
+                # All prefixes already start with SOS, use as is
+                tokens = prefix_ids
+                print(f"[INFO] Prefix already contains SOS token, using as is")
+            else:
+                    # Some or all prefixes don't start with SOS, prepend it
+                    tokens = torch.cat([
+                        torch.full((batch_size, 1), sos_id, device=device, dtype=torch.long),
+                        prefix_ids
+                    ], dim=1)
+                    print(f"[INFO] Added SOS token to prefix")
         else:
+            # No prefix provided, start with SOS only
             tokens = torch.full((batch_size, 1), sos_id, device=device, dtype=torch.long)
 
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
+        # Prepare spectrum memory once (since it doesn't change during generation)
+        spectrum_memory = self._prepare_spectrum_memory(spectrum_input)  # (B, num_chunks, d_model)
+
         # ------------------------------------------------------------------
         # Autoregressive loop
         # ------------------------------------------------------------------
-        while tokens.size(1) < max_len and (not finished.all()):
+        # Autoregressive generation loop
+        for step in range(max_len - tokens.size(1)):
+            B, T = tokens.shape
+            
+            # Create attention mask
             attn_mask = (tokens != pad_id).float()
-            # Teacher-forcing forward to obtain logits for current sequence
-            logits = self.forward_pretrain(spectrum_input, tokens, attn_mask, return_value=False)
-            if isinstance(logits, tuple):
-                logits = logits[0]
-            # Get the actual last token position for each sequence (exclude padding)
-            last_token_idx = (attn_mask.sum(dim=1) - 1).clamp(min=0).long()  # (B,)
-            next_logits = logits[torch.arange(batch_size, device=device), last_token_idx] / max(temperature, 1e-6)
+            
+            # Forward pass for inference
+            # Position embeddings
+            pos_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+            dec_in = self.token_embed(tokens) + self.pos_embed(pos_ids)
+            
+            # Causal mask
+            causal_mask = self._generate_square_subsequent_mask(T).to(device)
+            
+            # Decoder forward
+            dec_out = self.decoder(
+                tgt=dec_in,
+                memory=spectrum_memory,
+                tgt_mask=causal_mask,
+                tgt_is_causal=True,
+                tgt_key_padding_mask=(attn_mask == 0).bool()
+            )  # (B, T, d_model)
+            
+            # Get logits for the last position (next token to generate)
+            last_hidden = dec_out[:, -1, :]  # (B, d_model)
+            next_logits = self.action_head(last_hidden)  # (B, vocab_size)
 
-            # Mask out disallowed tokens (PAD, SOS, UNK) – EOS is allowed
+            # Apply temperature
+            next_logits = next_logits / max(temperature, 1e-6)
+
+            # Mask out disallowed tokens
             next_logits[:, pad_id] = float('-1e9')
             next_logits[:, sos_id] = float('-1e9')
-            next_logits[:, self.unk_token_id] = float('-1e9')
+            next_logits[:, unk_id] = float('-1e9')
 
+            # Sample or select greedily
             if greedy or temperature == 0.0:
-                next_tokens = torch.argmax(next_logits, dim=-1)
+                next_tokens = torch.argmax(next_logits, dim=-1)  # (B,)
             else:
                 probs = torch.softmax(next_logits, dim=-1)
-                next_tokens = torch.multinomial(probs, 1).squeeze(-1)
+                next_tokens = torch.multinomial(probs, 1).squeeze(-1)  # (B,)
 
-            # For sequences that already finished, just append PAD
+            # For sequences that already finished, append PAD
             next_tokens[finished] = pad_id
+            
+            # Update finished status
             finished = finished | (next_tokens == eos_id)
 
-            # Append
+            # Append new tokens to sequences
             tokens = torch.cat([tokens, next_tokens.unsqueeze(1)], dim=1)
 
-            # Early break if all finished and we honour stop flag
+            # Early stopping if all sequences finished
             if stop_at_eos and finished.all():
                 break
 
-        # ------------------------------------------------------------------
-        # Pad / truncate to exactly ``max_len``
-        # ------------------------------------------------------------------
-        seq_len = tokens.size(1)
-        if seq_len < max_len:
-            pad_tensor = torch.full((batch_size, max_len - seq_len), pad_id, device=device, dtype=torch.long)
+        # Pad or truncate to exactly max_len
+        current_len = tokens.size(1)
+        if current_len < max_len:
+            pad_len = max_len - current_len
+            pad_tensor = torch.full((batch_size, pad_len), pad_id, device=device, dtype=torch.long)
             tokens = torch.cat([tokens, pad_tensor], dim=1)
-        elif seq_len > max_len:
+        elif current_len > max_len:
             tokens = tokens[:, :max_len]
 
+        # Create final attention mask
         attention_mask = (tokens != pad_id).float()
+        
         return tokens, attention_mask
 
 # -----------------------------------------------------------------------------
